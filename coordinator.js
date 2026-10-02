@@ -127,18 +127,19 @@ function dashboardHTML() {
     const mem = a.info && a.info.totalMem ? (a.info.totalMem / 1073741824).toFixed(1) : '?';
     const cpus = a.info && a.info.cpus != null ? a.info.cpus : '?';
     const plat = a.info && a.info.platform ? a.info.platform : '?';
+    const seen = a.online ? '<span class="dot"></span>online' : `${a.lastSeenAgo}s ago`;
     return `      <tr${a.online ? '' : ' class="dim"'}>
         <td>${esc(a.id)}</td>
         <td>${esc(plat)}</td>
         <td class="num">${esc(cpus)}</td>
         <td class="num">${esc(mem)}</td>
-        <td>${a.busy ? '<span class="run">busy</span>' : 'idle'}</td>
+        <td>${a.busy ? '<span class="run">busy</span>' : '<span class="mut">idle</span>'}</td>
         <td class="num">${a.jobsDone}</td>
-        <td class="num">${a.lastSeenAgo}s ago</td>
+        <td class="num">${seen}</td>
       </tr>`;
   }).join('\n') || '      <tr><td colspan="7" class="dim">no agents yet — run: node agent.js</td></tr>';
 
-  const statusCls = (s) => (s === 'done' ? 'ok' : s === 'running' ? 'run' : s === 'queued' ? '' : 'err');
+  const statusCls = (s) => (s === 'done' ? 'ok' : s === 'running' ? 'run' : s === 'queued' ? 'mut' : 'err');
   const jobRows = st.jobs.map((j) => `      <tr>
         <td>${esc(j.id)}</td>
         <td>${esc(j.batch)}</td>
@@ -158,22 +159,25 @@ function dashboardHTML() {
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { background:#0d1117; color:#c9d1d9; margin:32px auto; max-width:900px; padding:0 16px;
-         font:14px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-  h1 { color:#58d68d; font-size:22px; margin:0; }
-  h1 span { color:#8b949e; font-weight:normal; font-size:13px; margin-left:8px; }
-  .stats { color:#8b949e; margin:6px 0 8px; }
-  .stats b { color:#c9d1d9; }
-  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#8b949e; margin:26px 0 8px; }
+  body { background:#0a0a0a; color:#fafafa; margin:32px auto; max-width:900px; padding:0 16px;
+         font:14px/1.5 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+  h1 { font-size:22px; font-weight:600; letter-spacing:-0.01em; margin:0; }
+  h1 span { color:#a1a1a1; font-weight:normal; font-size:13px; letter-spacing:0; margin-left:8px; }
+  .stats { color:#a1a1a1; margin:6px 0 8px; }
+  .stats b { color:#fafafa; font-weight:600; }
+  h2 { color:#a1a1a1; font-size:11px; font-weight:600; letter-spacing:.08em; margin:26px 0 8px; text-transform:uppercase; }
   table { border-collapse:collapse; width:100%; }
-  th, td { text-align:left; padding:6px 10px; border-bottom:1px solid #21262d; white-space:nowrap; }
-  th { color:#8b949e; font-weight:600; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid rgba(255,255,255,0.12); white-space:nowrap; }
+  th { color:#a1a1a1; font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; }
+  tbody tr:hover { background:rgba(255,255,255,0.04); }
   td.num, th.num { text-align:right; }
   .dim { opacity:.4; }
-  .ok { color:#58d68d; }
-  .run { color:#e3b341; }
-  .err { color:#f85149; }
-  footer { margin-top:32px; color:#8b949e; font-size:12px; }
+  .mut { color:#a1a1a1; }
+  .dot { background:#fafafa; border-radius:50%; display:inline-block; height:8px; margin-right:6px; vertical-align:-1px; width:8px; }
+  .ok, .run, .err { color:#fafafa; }
+  .run, .err { font-weight:600; }
+  footer { border-top:1px solid rgba(255,255,255,0.12); color:#a1a1a1; font-size:12px; margin-top:32px; padding-top:12px; }
+  footer div + div { margin-top:4px; }
 </style>
 </head>
 <body>
@@ -193,7 +197,10 @@ ${agentRows}
 ${jobRows}
     </tbody>
   </table>
-  <footer>MittiGrid v0.1 &middot; coordinator :${PORT} &middot; refreshes every 3s</footer>
+  <footer>
+    <div>MittiGrid v0.1 &middot; coordinator :${PORT} &middot; refreshes every 3s</div>
+    <div>MittiGrid &middot; free &amp; open source &middot; pool every device you own</div>
+  </footer>
 </body>
 </html>`;
 }
