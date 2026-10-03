@@ -29,6 +29,35 @@ v0.2 keeps every v0.1 feature and adds the first real piece of the vision: **a m
 
 What v0.2 does **not** do yet: real model weights or GPU work, parallel inference (one forward pass at a time), authentication, or persistence (coordinator state is in-memory). The shard endpoint and the `node:vm` sandbox are isolation, not a security boundary.
 
+## What v0.3 adds (honest)
+
+v0.3 keeps every v0.1 + v0.2 feature and points the grid at real models: **llama.cpp RPC worker discovery, battery-aware participation, and a live pulse map.**
+
+- **Battery-aware participation** — every heartbeat carries `{battery, standby, ramGB, rpc}`. A device reading below 30% while discharging flips to **standby**: the coordinator pulls its model layers (they move to survivors through the existing failover path) and drops it from the llama RPC pool, but keeps it joined — and it recovers automatically once it charges. On Termux the agent reads the real battery; anywhere else, simulate one: `MITTI_FAKE_BATTERY='{"level":22,"charging":false}'`.
+- **RPC advertisement** — an agent that finds a local llama.cpp `rpc-server` (env `MITTI_RPC_PORT`, else a one-time 1s TCP probe of `127.0.0.1:50052` at boot) advertises `{rpc:{host,port}}` plus its RAM (`os.totalmem`, 1 decimal) to the coordinator.
+- **One command for pooled RAM** — `GET /llama/command?model=<file.gguf>` returns a ready-to-run `llama-server` command using only live, charged workers (`--rpc` biggest-RAM-first, `--tensor-split` proportional to each worker's RAM). `GET /llama/status` shows the pool; 404 with a clean error when nobody has joined. The dashboard's REAL MODEL section shows ready state, workers with battery chips, and a copyable command block.
+- **PULSE MAP** — the dashboard draws shard-holding devices as labeled nodes on a monochrome canvas. On every inference pass a bright pulse dot travels node-to-node in hop order with a fading trail; idle nodes breathe softly. The last pass's hops are serialized into the dashboard state, so the map survives the 3s meta-refresh cycle.
+- **Unit tests** — `npm test` covers llama worker selection (ordering, tensor split, low-battery exclusion) and the battery rules (fake JSON variants, garbage → null).
+
+What v0.3 does **not** do: load GGUF weights itself (it orchestrates `llama-server` via `--rpc`), make tokens faster (RPC pooling is capacity, not speed), authentication, or persistence.
+
+## Real models (llama.cpp RPC)
+
+With a llama.cpp `rpc-server` running on each device (build guide for Termux and laptops: [docs/REAL-MODELS.md](docs/REAL-MODELS.md)), the coordinator turns your devices into one shared memory pool for llama.cpp:
+
+```
+curl "http://<coordinator-ip>:7400/llama/command?model=Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+# -> llama-server -m Qwen2.5-7B-Instruct-Q4_K_M.gguf --rpc 192.168.1.20:50052,192.168.1.10:50052 --tensor-split 16,8 --host 0.0.0.0 --port 8080 -ngl 99
+```
+
+Honest limits (full list in the guide):
+
+- **Capacity, not speed** — you fit bigger models across devices; tokens still hop device-to-device, so expect roughly 1-10 tok/s on Wi-Fi.
+- **rpc-server has NO authentication** — trusted LAN or Tailscale only. Never expose it to the internet.
+- **Phones thermal-throttle** — plugged in, cool, and screen-off is the good citizen.
+
+**Battery rule:** a device holds model shards and joins the RPC pool only while above 30% battery or charging. Below that it goes standby — kept joined, layers moved to survivors, excluded from generated commands — and reappears automatically once it charges.
+
 ## Architecture
 
 ```
@@ -68,7 +97,7 @@ node agent.js --coord http://<pc-ip>:7400 --name old-phone-1
 
 Options: `agent.js --name <name> --coord <url> --port <shard-port>` · `demo.js --coord <url> --chunks <n>` · `demo.js --model` · coordinator port: `PORT=7400`.
 
-Model endpoints: `POST /model/infer {"input":[8 numbers]}` runs one forward pass · `GET /model/status` shows the shard map and last trace · the dashboard carries a MODEL SHARDS table (agent, layers, last hop ms).
+Model endpoints: `POST /model/infer {"input":[8 numbers]}` runs one forward pass · `GET /model/status` shows the shard map and last trace · the dashboard carries a MODEL SHARDS table (agent, layers, last hop ms). Llama endpoints: `GET /llama/status` · `GET /llama/command?model=<file.gguf>` (RPC worker pool, see Real models below).
 
 ## Tailscale tip
 

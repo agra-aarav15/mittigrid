@@ -1,4 +1,4 @@
-// MittiGrid v0.2 — coordinator
+// MittiGrid v0.3 — coordinator
 // Zero dependencies, node built-ins only. Node >= 20.
 //
 // v0.1 routes (unchanged):
@@ -20,6 +20,16 @@
 //   GET  /model/next?from=N -> which agent holds layer N (agents use this to
 //                       forward activations to the next hop)
 //
+// v0.3 llama.cpp routes (RPC worker pool for real models):
+//   GET  /llama/status -> { workers:[{agent,host,port,ramGB,battery}], ready, command }
+//   GET  /llama/command?model=<file.gguf> -> { ok, model, workers, command }
+//                        (404 {error:'No RPC workers joined yet'} when empty)
+//
+// Battery awareness: /join heartbeats now carry {battery, standby, ramGB, rpc}.
+// A standby (low-battery) agent stays joined but holds no shards and never
+// appears in the llama pool — its layers move to survivors through the
+// existing failover path, and it recovers automatically once it charges.
+//
 // Shard assignment travels to agents as a control message on /poll:
 // { control: { type:'shard', start, end } }. Agents acknowledge it by sending
 // their current range back on the next /join. (POST /shard/assign was the
@@ -27,6 +37,8 @@
 
 import http from 'node:http';
 import { MODEL_LAYERS, DIM, validInput } from './model.js';
+import { batteryLow, normalizeBattery } from './lib/battery.js';
+import { selectWorkers, buildLlamaCommand } from './lib/llama-command.js';
 
 const PORT = Number(process.env.PORT) || 7400;
 const OFFLINE_MS = 15000; // agent is dimmed/offline when lastSeen is older than this
@@ -34,7 +46,9 @@ const HOP_TIMEOUT_MS = 2000; // hard cap on one shard hop (coordinator -> agent)
 const SWEEP_MS = 3000; // periodic rebalance: drops agents that went offline
 
 // id -> { info:{platform,cpus,totalMem}, lastSeen, busy, jobsDone,
-//         shardCapable, shardUrl, shardAcked }
+//         shardCapable, shardUrl, shardAcked,
+//         v0.3: battery:{level,charging,mocked,low}|null, standby, ramGB,
+//         rpc:{host,port}|null }
 const agents = new Map();
 // { id, batch, type, payload, status:'queued'|'running'|'done', agent, result, error, ms }
 const jobs = [];
@@ -52,6 +66,7 @@ const evicted = new Map();
 let inferBusy = false; // an inference pass is in flight (route must not move)
 let lastTrace = null; // per-hop trace of the last completed pass
 let lastInferMs = null;
+let passCount = 0; // completed inference passes since boot
 const lastHopMs = new Map(); // agentId -> ms of its hop in the last pass
 
 const now = () => Date.now();
@@ -171,7 +186,7 @@ function rebalance(reason) {
   if (inferBusy) return;
   for (const [id, until] of evicted) if (until <= now()) evicted.delete(id);
   const ids = [...agents.entries()]
-    .filter(([id, a]) => isOnline(a) && a.shardCapable && a.shardUrl && !evicted.has(id))
+    .filter(([id, a]) => isOnline(a) && a.shardCapable && a.shardUrl && !evicted.has(id) && !a.standby)
     .map(([id]) => id)
     .sort((a, b) => (a < b ? -1 : 1));
   const next = new Map();
@@ -247,6 +262,47 @@ function modelStatus() {
     })),
     lastInferenceMs: lastInferMs,
     lastTrace,
+    passCount,
+  };
+}
+
+// ---- v0.3: llama.cpp RPC pool ---------------------------------------------
+// Workers = online agents advertising a local rpc-server, minus standby
+// (low-battery) devices. lib/llama-command.js owns eligibility, ordering
+// (biggest ramGB first) and the generated command, so it stays unit-testable.
+
+const LLAMA_MODEL_PLACEHOLDER = 'model.gguf'; // dashboard's copyable command
+
+function llamaCandidates() {
+  const out = [];
+  for (const [id, a] of agents) {
+    if (!isOnline(a)) continue;
+    out.push({
+      agent: id,
+      host: a.rpc ? a.rpc.host : null,
+      port: a.rpc ? a.rpc.port : null,
+      ramGB: a.ramGB,
+      battery: a.battery,
+      standby: a.standby === true,
+    });
+  }
+  return out;
+}
+
+function llamaStatus(model) {
+  const workers = selectWorkers(llamaCandidates());
+  return {
+    workers: workers.map((w) => ({
+      agent: w.agent,
+      host: w.host,
+      port: w.port,
+      ramGB: w.ramGB,
+      battery: w.battery
+        ? { level: w.battery.level, charging: w.battery.charging, low: batteryLow(w.battery) }
+        : null,
+    })),
+    ready: workers.length > 0,
+    command: buildLlamaCommand(model, workers),
   };
 }
 
@@ -297,6 +353,7 @@ async function doInference(input) {
         const ms = Date.now() - wall0;
         lastTrace = out.hops || [];
         lastInferMs = ms;
+        passCount++;
         for (const h of lastTrace) if (h && h.agent) lastHopMs.set(h.agent, h.ms);
         console.log(
           `[infer] ok in ${ms}ms (${lastTrace.length} hop(s): ` +
@@ -334,6 +391,11 @@ function statusPayload() {
     jobsDone: a.jobsDone,
     lastSeenAgo: Math.round((now() - a.lastSeen) / 1000),
     online: isOnline(a),
+    // v0.3 heartbeat fields, for /status.json consumers and the dashboard
+    battery: a.battery || null,
+    standby: a.standby === true,
+    ramGB: a.ramGB ?? null,
+    rpc: a.rpc || null,
   }));
   const stats = {
     online: agentList.filter((a) => a.online).length,
@@ -346,6 +408,8 @@ function statusPayload() {
 function dashboardHTML() {
   const st = statusPayload();
   const model = st.model;
+  // copyable command uses a placeholder model name; /llama/command?model=... is authoritative
+  const llama = llamaStatus(LLAMA_MODEL_PLACEHOLDER);
 
   const agentRows = st.agents.map((a) => {
     const mem = a.info && a.info.totalMem ? (a.info.totalMem / 1073741824).toFixed(1) : '?';
@@ -379,6 +443,37 @@ function dashboardHTML() {
         <td class="num">${j.ms != null ? j.ms : '—'}</td>
       </tr>`).join('\n') || '      <tr><td colspan="6" class="dim">no jobs yet — run: node demo.js</td></tr>';
 
+  // ---- v0.3: REAL MODEL section (llama.cpp RPC pool) ----
+  const batteryChip = (b) => b == null
+    ? '<span class="mut">no battery data</span>'
+    : b.low
+      ? `<span class="chip warn" title="standby until charged">low ${esc(b.level)}%</span>`
+      : `<span class="chip" title="${b.mocked ? 'mocked reading' : 'live reading'}">${b.charging ? 'charging' : 'ok'} ${esc(b.level)}%</span>`;
+  const llamaRows = llama.workers.map((w) => `      <tr>
+        <td>${esc(w.agent)}</td>
+        <td>${esc(w.host)}:${esc(w.port)}</td>
+        <td class="num">${esc(w.ramGB)}</td>
+        <td>${batteryChip(w.battery)}</td>
+      </tr>`).join('\n') || '      <tr><td colspan="4" class="dim">no rpc workers yet — run rpc-server on a device (docs/REAL-MODELS.md)</td></tr>';
+  const standbyAgents = st.agents.filter((a) => a.online && a.standby);
+  const standbyNote = standbyAgents.length
+    ? ` &middot; <span class="dim">standby: ${standbyAgents.map((a) => esc(a.id)).join(', ')} (low battery — recovers on charge)</span>`
+    : '';
+  const cmdBlock = llama.command
+    ? `  <pre class="cmd">${esc(llama.command)}</pre>
+  <p class="stats">copy to the laptop that runs llama-server &middot; replace model.gguf with your quantized model &middot; guide: <b>docs/REAL-MODELS.md</b></p>`
+    : '  <p class="stats dim">waiting for rpc workers — see docs/REAL-MODELS.md</p>';
+
+  // ---- v0.3: PULSE MAP state (must survive the meta-refresh cycle) ----
+  const pulse = {
+    nodes: model.shards.map((s) => ({ agent: s.agent, range: s.range })),
+    pass: model.lastTrace ? { ms: model.lastInferenceMs, hops: model.lastTrace } : null,
+  };
+  const pulseJSON = JSON.stringify(pulse).replace(/</g, '\\u003c');
+  const pulseNote = model.lastTrace
+    ? `last pass <b>${esc(model.lastInferenceMs)}ms</b> &middot; <b>${model.lastTrace.length}</b> hop(s) &middot; the pulse replays on each refresh`
+    : 'no inference yet — run <b>node demo.js --model</b>';
+
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -406,12 +501,17 @@ function dashboardHTML() {
   .dot { background:#fafafa; border-radius:50%; display:inline-block; height:8px; margin-right:6px; vertical-align:-1px; width:8px; }
   .ok, .run, .err { color:#fafafa; }
   .run, .err { font-weight:600; }
+  .chip { border:1px solid rgba(255,255,255,0.3); border-radius:3px; font-size:11px; padding:0 6px; white-space:nowrap; }
+  .chip.warn { font-weight:700; }
+  .cmd { background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.14); font:12px/1.6 ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+         margin:10px 0 4px; overflow-x:auto; padding:10px 12px; white-space:pre-wrap; word-break:break-all; }
+  #pulse { background:#0a0a0a; border:1px solid rgba(255,255,255,0.12); display:block; height:auto; max-width:100%; width:100%; }
   footer { border-top:1px solid rgba(255,255,255,0.12); color:#a1a1a1; font-size:12px; margin-top:32px; padding-top:12px; }
   footer div + div { margin-top:4px; }
 </style>
 </head>
 <body>
-  <h1>MittiGrid <span>every device you own, one brain</span></h1>
+  <h1>MittiGrid <span>v0.3 &middot; every device you own, one brain</span></h1>
   <p class="stats">agents online <b>${st.stats.online}</b> &middot; queued <b>${st.stats.queued}</b> &middot; done <b>${st.stats.done}</b></p>
   <h2>agents</h2>
   <table>
@@ -421,7 +521,7 @@ ${agentRows}
     </tbody>
   </table>
   <h2>MODEL SHARDS</h2>
-  <p class="stats"><b>${model.layers}</b> layers &middot; <b>${model.shards.length}</b> shard(s) &middot; ${model.ready ? 'ready' : 'waiting for shard agents'}${model.lastInferenceMs != null ? ` &middot; last pass <b>${model.lastInferenceMs}ms</b>` : ''}</p>
+  <p class="stats"><b>${model.layers}</b> layers &middot; <b>${model.shards.length}</b> shard(s) &middot; ${model.ready ? 'ready' : 'waiting for shard agents'}${model.lastInferenceMs != null ? ` &middot; last pass <b>${model.lastInferenceMs}ms</b>` : ''}${model.passCount ? ` &middot; <b>${model.passCount}</b> pass(es) served` : ''}</p>
   <table>
     <thead><tr><th>agent</th><th class="num">layers</th><th class="num">last hop ms</th></tr></thead>
     <tbody>
@@ -429,6 +529,117 @@ ${shardRows}
     </tbody>
   </table>
   <p class="stats">run inference: <b>node demo.js --model</b> &middot; or POST /model/infer {"input":[8 numbers]}</p>
+  <h2>REAL MODEL</h2>
+  <p class="stats"><b>${llama.workers.length}</b> rpc worker(s) &middot; ${llama.ready ? 'ready' : 'waiting for rpc agents'}${standbyNote}</p>
+  <table>
+    <thead><tr><th>agent</th><th>rpc</th><th class="num">ram gb</th><th>battery</th></tr></thead>
+    <tbody>
+${llamaRows}
+    </tbody>
+  </table>
+${cmdBlock}
+  <h2>PULSE MAP</h2>
+  <canvas id="pulse" width="860" height="150"></canvas>
+  <p class="stats">${pulseNote}</p>
+  <script>
+    const MITTI_STATE = ${pulseJSON};
+    (() => {
+      const cv = document.getElementById('pulse');
+      if (!cv) return;
+      const ctx = cv.getContext('2d');
+      const W = cv.width, H = cv.height, CY = 70, PAD = 70;
+      const nodes = (MITTI_STATE && MITTI_STATE.nodes) || [];
+      const pass = (MITTI_STATE && MITTI_STATE.pass) || null;
+      const index = new Map(nodes.map((n, i) => [n.agent, i]));
+      const px = (i) => (nodes.length <= 1 ? W / 2 : PAD + (i * (W - 2 * PAD)) / (nodes.length - 1));
+      // hop path as node indexes: skip agents that left the map, collapse repeats
+      const hops = [];
+      const trace = (pass && pass.hops) || [];
+      for (let k = 0; k < trace.length; k++) {
+        const i = index.get(trace[k].agent);
+        if (i == null) continue;
+        if (hops.length && hops[hops.length - 1] === i) continue;
+        hops.push(i);
+      }
+      const SEG_MS = 550; // pulse travel time per hop
+      const LEAD_MS = 500; // let the idle glow establish first
+      const t0 = performance.now();
+      const rgba = (a) => 'rgba(255,255,255,' + a + ')';
+      // x position at segment-fraction c (0..hops.length-1)
+      const segX = (c) => {
+        const last = hops.length - 1;
+        const v = Math.max(0, Math.min(c, last));
+        const i0 = hops[Math.floor(v)];
+        const i1 = hops[Math.min(Math.floor(v) + 1, last)];
+        const f = v - Math.floor(v);
+        return px(i0) + (px(i1) - px(i0)) * f;
+      };
+      function draw(nowMs) {
+        const t = nowMs - t0;
+        ctx.clearRect(0, 0, W, H);
+        if (!nodes.length) {
+          ctx.fillStyle = '#737373';
+          ctx.font = '12px monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('no shard agents yet - the map lights up when devices join', W / 2, CY);
+          return; // nothing to animate; the next refresh carries new state
+        }
+        // link line
+        ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(px(0), CY);
+        for (let i = 1; i < nodes.length; i++) ctx.lineTo(px(i), CY);
+        ctx.stroke();
+        // soft idle breathing glow per node
+        ctx.textAlign = 'center';
+        for (let i = 0; i < nodes.length; i++) {
+          const x = px(i);
+          const breathe = Math.sin(t / 900 + i * 0.9);
+          ctx.beginPath();
+          ctx.arc(x, CY, 11 + breathe * 1.5, 0, Math.PI * 2);
+          ctx.fillStyle = rgba(0.07 + (0.05 * (breathe + 1)) / 2);
+          ctx.fill();
+          ctx.beginPath();
+          ctx.arc(x, CY, 4.5, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(250,250,250,0.9)';
+          ctx.fill();
+          ctx.font = '10px monospace';
+          ctx.fillStyle = '#a1a1a1';
+          ctx.fillText(nodes[i].agent, x, i % 2 ? CY + 44 : CY + 28);
+          ctx.fillStyle = 'rgba(161,161,161,0.6)';
+          ctx.fillText(nodes[i].range, x, CY - 20);
+        }
+        // bright pulse dot, node-to-node in hop order, with a fading trail
+        if (hops.length) {
+          const p = (t - LEAD_MS) / SEG_MS;
+          if (p >= 0) {
+            for (let k = 10; k >= 1; k--) {
+              const tx = segX(p - k * 0.07);
+              ctx.beginPath();
+              ctx.arc(tx, CY, Math.max(1, 4 - k * 0.32), 0, Math.PI * 2);
+              ctx.fillStyle = rgba(0.28 * (1 - k / 11));
+              ctx.fill();
+            }
+            ctx.beginPath();
+            ctx.arc(segX(p), CY, 5, 0, Math.PI * 2);
+            ctx.fillStyle = '#ffffff';
+            ctx.fill();
+            const last = hops.length - 1;
+            if (p > last) { // arrival flash on the final node
+              const a = Math.max(0, 1 - (p - last) * 0.9);
+              ctx.beginPath();
+              ctx.arc(px(hops[last]), CY, 10 + (1 - a) * 14, 0, Math.PI * 2);
+              ctx.strokeStyle = rgba(a);
+              ctx.stroke();
+            }
+          }
+        }
+        requestAnimationFrame(draw);
+      }
+      requestAnimationFrame(draw);
+    })();
+  </script>
   <h2>jobs</h2>
   <table>
     <thead><tr><th>id</th><th>batch</th><th>type</th><th>status</th><th>agent</th><th class="num">ms</th></tr></thead>
@@ -437,7 +648,7 @@ ${jobRows}
     </tbody>
   </table>
   <footer>
-    <div>MittiGrid v0.2 &middot; coordinator :${PORT} &middot; refreshes every 3s</div>
+    <div>MittiGrid v0.3 &middot; coordinator :${PORT} &middot; refreshes every 3s</div>
     <div>MittiGrid &middot; free &amp; open source &middot; pool every device you own</div>
   </footer>
 </body>
@@ -470,6 +681,23 @@ const server = http.createServer(async (req, res) => {
       const shardPort = Math.floor(Number(body.shardPort)) || 0;
       const capable = body.shardCapable === true && shardPort > 0;
       evicted.delete(body.id); // a join is proof of life: clear any failover eviction
+
+      // v0.3 heartbeat fields: battery, standby, ramGB, rpc. `low` is
+      // recomputed here — the coordinator never trusts a client-computed flag.
+      const batt = body.battery && typeof body.battery === 'object'
+        ? normalizeBattery(body.battery, body.battery.mocked === true)
+        : null;
+      const standby = body.standby === true || (batt != null && batt.low);
+      const ramGBn = Number(body.ramGB);
+      const ramGB = Number.isFinite(ramGBn) && ramGBn > 0
+        ? Math.round(ramGBn * 10) / 10
+        : (body.info && body.info.totalMem ? Math.round((body.info.totalMem / 1e9) * 10) / 10 : null);
+      const rpcPortN = Math.floor(Number(body.rpc && body.rpc.port));
+      const rpcHost = body.rpc && typeof body.rpc.host === 'string' ? body.rpc.host.trim() : '';
+      const rpc = rpcHost && Number.isInteger(rpcPortN) && rpcPortN > 0 && rpcPortN < 65536
+        ? { host: rpcHost, port: rpcPortN }
+        : null;
+
       const a = {
         info: body.info || (prev && prev.info) || {},
         lastSeen: now(),
@@ -479,6 +707,11 @@ const server = http.createServer(async (req, res) => {
         shardCapable: capable,
         shardUrl: capable ? shardUrlFor(connHost(req), shardPort) : null,
         shardAcked: null,
+        // v0.3: battery-aware participation + llama.cpp RPC advertisement
+        battery: batt,
+        standby,
+        ramGB,
+        rpc,
       };
       const desired = shards.get(body.id);
       if (capable && desired && Array.isArray(body.shard) &&
@@ -486,6 +719,14 @@ const server = http.createServer(async (req, res) => {
         a.shardAcked = [desired[0], desired[1]];
       }
       agents.set(body.id, a);
+      // v0.3: a device that just went low-battery gives up its layers right
+      // now via the existing failover path (rebalance below keeps it out of
+      // future maps). Recovery is automatic: the next charged join clears the
+      // eviction above, and the sweep re-shards normally.
+      if (standby && !(prev && prev.standby)) {
+        if (shards.has(body.id)) failover(body.id);
+        else console.log(`[battery] ${body.id} low -> standby (recovers when charging)`);
+      }
       if (capable) rebalance('join');
       return sendJSON(res, { ok: true });
     }
@@ -499,7 +740,8 @@ const server = http.createServer(async (req, res) => {
         agents.set(id, a);
       }
       a.lastSeen = now();
-      const desired = shards.get(id);
+      // v0.3: standby agents hold no shards — never hand them layer control
+      const desired = a.standby ? null : shards.get(id);
       const control = desired && !(a.shardAcked && a.shardAcked[0] === desired[0] && a.shardAcked[1] === desired[1])
         ? { type: 'shard', start: desired[0], end: desired[1] }
         : null;
@@ -589,6 +831,26 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, { ok: true, next: { agent: holder.agent, url: holder.url, start: holder.start, end: holder.end } });
     }
 
+    // ---- v0.3 llama.cpp routes ----
+
+    if (req.method === 'GET' && path === '/llama/status') {
+      const model = url.searchParams.get('model') || LLAMA_MODEL_PLACEHOLDER;
+      return sendJSON(res, llamaStatus(model));
+    }
+
+    if (req.method === 'GET' && path === '/llama/command') {
+      const workers = selectWorkers(llamaCandidates());
+      if (!workers.length) {
+        return sendJSON(res, { error: 'No RPC workers joined yet' }, 404);
+      }
+      const model = String(url.searchParams.get('model') || '').trim();
+      if (!model) {
+        return sendJSON(res, { ok: false, error: 'model query param required, e.g. /llama/command?model=Qwen2.5-7B-Instruct-Q4_K_M.gguf' }, 400);
+      }
+      console.log(`[llama] command for ${model} across ${workers.length} worker(s)`);
+      return sendJSON(res, { ok: true, model, workers: workers.length, command: buildLlamaCommand(model, workers) });
+    }
+
     res.writeHead(404, { 'content-type': 'text/plain' });
     res.end('not found');
   } catch (e) {
@@ -598,9 +860,10 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[mittigrid] coordinator listening on http://localhost:${PORT}`);
+  console.log(`[mittigrid] v0.3 coordinator listening on http://localhost:${PORT}`);
   console.log(`[mittigrid] dashboard: http://localhost:${PORT}/  |  status: http://localhost:${PORT}/status.json`);
   console.log(`[mittigrid] model: ${MODEL_LAYERS} layers, sharded across agents — POST /model/infer to run a pass`);
+  console.log(`[mittigrid] llama: GET /llama/status | GET /llama/command?model=<file.gguf> (needs rpc-server on a device)`);
 });
 
 // Periodic rebalance: drops shard entries for agents whose heartbeats went

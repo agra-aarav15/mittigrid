@@ -1,4 +1,4 @@
-// MittiGrid v0.2 — agent
+// MittiGrid v0.3 — agent
 // Zero dependencies, node built-ins only. Node >= 20.
 //
 // Joins a MittiGrid coordinator, heartbeats every 3s, polls for jobs,
@@ -12,12 +12,25 @@
 // the head and returns the final vector. Heartbeats and normal jobs never
 // stop while it hosts layers.
 //
+// v0.3: every heartbeat (the /join call) carries battery + rpc fields:
+//   battery — {level, charging, mocked, low} | null (lib/battery.js: env
+//             MITTI_FAKE_BATTERY wins when set, else termux-battery-status)
+//   standby — true while the battery is low (discharging < 30%): the
+//             coordinator keeps us joined but pulls our layers and drops us
+//             from the llama RPC pool; we recover automatically on charge
+//   ramGB   — os.totalmem()/1e9, one decimal (drives --tensor-split)
+//   rpc     — {host, port} of a local llama.cpp rpc-server | null (env
+//             MITTI_RPC_PORT pins it; otherwise a one-time 1s probe of
+//             127.0.0.1:50052 at boot — if something answers, we advertise)
+//
 //   node agent.js [--name my-device] [--coord http://<coordinator-ip>:7400] [--port 7410]
 
 import os from 'node:os';
 import vm from 'node:vm';
+import net from 'node:net';
 import http from 'node:http';
 import { MODEL_LAYERS, DIM, runLayers, head, validInput } from './model.js';
+import { readBattery } from './lib/battery.js';
 
 function arg(name, def) {
   const i = process.argv.indexOf('--' + name);
@@ -51,6 +64,56 @@ const info = {
   cpus: os.cpus().length,
   totalMem: os.totalmem(),
 };
+
+// ---- v0.3: battery + rpc advertisement ------------------------------------
+
+const BATTERY_REFRESH_MS = 10000; // readings are cheap, but not free
+const RPC_PROBE_HOST = '127.0.0.1';
+const RPC_PROBE_PORT = 50052; // llama.cpp rpc-server default
+const RPC_PROBE_TIMEOUT_MS = 1000;
+
+let battery = null; // last known reading {level,charging,mocked,low} | null
+let batteryReadAt = 0;
+
+async function refreshBattery() {
+  if (Date.now() - batteryReadAt < BATTERY_REFRESH_MS) return;
+  batteryReadAt = Date.now();
+  try {
+    battery = await readBattery();
+  } catch {
+    battery = null;
+  }
+}
+
+const standbyNow = () => !!(battery && battery.low);
+
+function lanIp() {
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const i of ifaces[name] || []) {
+      if (i.family === 'IPv4' && !i.internal) return i.address;
+    }
+  }
+  return '127.0.0.1';
+}
+
+// One-shot TCP connect: is something listening on host:port? Errors (refused,
+// timeout, unreachable) all resolve false — probing must never crash the agent.
+function probeTcp(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      s.destroy();
+      resolve(ok);
+    };
+    const s = net.connect({ host, port });
+    s.setTimeout(timeoutMs, () => finish(false));
+    s.once('connect', () => finish(true));
+    s.on('error', () => finish(false)); // stays attached: absorbs late errors
+  });
+}
 
 async function post(path, body, timeoutMs = 8000) {
   const res = await fetch(COORD + path, {
@@ -276,14 +339,54 @@ console.log(
 // Main loop: heartbeat every 3s while idle; grab the next job immediately
 // after finishing one so busy agents are never throttled by the cadence.
 async function main() {
+  // v0.3: read the battery before the first heartbeat so the very first join
+  // already carries {battery, standby, ramGB, rpc}.
+  await refreshBattery();
+
+  // v0.3: advertise a local llama.cpp rpc-server. MITTI_RPC_PORT pins it;
+  // otherwise probe the default port once — if something answers, advertise.
+  const envRpcPort = parseInt(process.env.MITTI_RPC_PORT, 10);
+  const rpcPort = Number.isFinite(envRpcPort) && envRpcPort > 0
+    ? envRpcPort
+    : (await probeTcp(RPC_PROBE_HOST, RPC_PROBE_PORT, RPC_PROBE_TIMEOUT_MS) ? RPC_PROBE_PORT : null);
+  const rpc = rpcPort ? { host: lanIp(), port: rpcPort } : null;
+  const ramGB = Math.round((info.totalMem / 1e9) * 10) / 10;
+
+  if (rpc) console.log(`[mittigrid] rpc-server advertised at ${rpc.host}:${rpc.port}`);
+  if (battery) {
+    console.log(
+      `[mittigrid] battery ${battery.level}%${battery.charging ? ' charging' : ''}` +
+        `${standbyNow() ? ' — low, joining in standby' : ''}${battery.mocked ? ' (mocked)' : ''}`
+    );
+  }
+
   // v0.2: bring up the shard server before the first join, so the very first
   // heartbeat can already advertise a live shard port.
   const shardPort = await startShardServer();
   console.log(`[mittigrid] shard server on :${shardPort} — hosting toy-model layers in the background`);
 
+  let wasStandby = standbyNow();
   for (;;) {
     try {
-      await post('/join', { id: NAME, info, shardCapable: true, shardPort, shard: myShard });
+      await refreshBattery();
+      const standby = standbyNow();
+      if (standby !== wasStandby) {
+        console.log(standby
+          ? 'battery low — joining in standby (layers pulled, rpc pool paused until charged)'
+          : 'battery recovered — leaving standby');
+        wasStandby = standby;
+      }
+      await post('/join', {
+        id: NAME,
+        info,
+        shardCapable: true,
+        shardPort,
+        shard: myShard,
+        battery, // v0.3: {level,charging,mocked,low} | null
+        standby, // v0.3: low battery -> coordinator pulls our layers
+        ramGB, // v0.3: drives llama --tensor-split
+        rpc, // v0.3: {host,port} of a local rpc-server | null
+      });
       const r = await get(`/poll?id=${encodeURIComponent(NAME)}`);
       // v0.2 control channel: the coordinator hands us our layer range here
       if (r && r.control && r.control.type === 'shard') {
