@@ -1,4 +1,4 @@
-// MittiGrid v0.3 — coordinator
+// MittiGrid v0.3.0 — coordinator
 // Zero dependencies, node built-ins only. Node >= 20.
 //
 // v0.1 routes (unchanged):
@@ -487,17 +487,17 @@ function dashboardHTML() {
   body { background:#0a0a0a; color:#fafafa; margin:32px auto; max-width:900px; padding:0 16px;
          font:14px/1.5 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
   h1 { font-size:22px; font-weight:600; letter-spacing:-0.01em; margin:0; }
-  h1 span { color:#a1a1a1; font-weight:normal; font-size:13px; letter-spacing:0; margin-left:8px; }
-  .stats { color:#a1a1a1; margin:6px 0 8px; }
+  h1 span { color:#a3a3a3; font-weight:normal; font-size:13px; letter-spacing:0; margin-left:8px; }
+  .stats { color:#a3a3a3; margin:6px 0 8px; }
   .stats b { color:#fafafa; font-weight:600; }
-  h2 { color:#a1a1a1; font-size:11px; font-weight:600; letter-spacing:.08em; margin:26px 0 8px; text-transform:uppercase; }
+  h2 { color:#a3a3a3; font-size:11px; font-weight:600; letter-spacing:.08em; margin:26px 0 8px; text-transform:uppercase; }
   table { border-collapse:collapse; width:100%; }
   th, td { text-align:left; padding:7px 10px; border-bottom:1px solid rgba(255,255,255,0.12); white-space:nowrap; }
-  th { color:#a1a1a1; font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; }
+  th { color:#a3a3a3; font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; }
   tbody tr:hover { background:rgba(255,255,255,0.04); }
   td.num, th.num { text-align:right; }
   .dim { opacity:.4; }
-  .mut { color:#a1a1a1; }
+  .mut { color:#a3a3a3; }
   .dot { background:#fafafa; border-radius:50%; display:inline-block; height:8px; margin-right:6px; vertical-align:-1px; width:8px; }
   .ok, .run, .err { color:#fafafa; }
   .run, .err { font-weight:600; }
@@ -506,7 +506,7 @@ function dashboardHTML() {
   .cmd { background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.14); font:12px/1.6 ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
          margin:10px 0 4px; overflow-x:auto; padding:10px 12px; white-space:pre-wrap; word-break:break-all; }
   #pulse { background:#0a0a0a; border:1px solid rgba(255,255,255,0.12); display:block; height:auto; max-width:100%; width:100%; }
-  footer { border-top:1px solid rgba(255,255,255,0.12); color:#a1a1a1; font-size:12px; margin-top:32px; padding-top:12px; }
+  footer { border-top:1px solid rgba(255,255,255,0.12); color:#a3a3a3; font-size:12px; margin-top:32px; padding-top:12px; }
   footer div + div { margin-top:4px; }
 </style>
 </head>
@@ -605,7 +605,7 @@ ${cmdBlock}
           ctx.fillStyle = 'rgba(250,250,250,0.9)';
           ctx.fill();
           ctx.font = '10px monospace';
-          ctx.fillStyle = '#a1a1a1';
+          ctx.fillStyle = '#a3a3a3';
           ctx.fillText(nodes[i].agent, x, i % 2 ? CY + 44 : CY + 28);
           ctx.fillStyle = 'rgba(161,161,161,0.6)';
           ctx.fillText(nodes[i].range, x, CY - 20);
@@ -648,7 +648,7 @@ ${jobRows}
     </tbody>
   </table>
   <footer>
-    <div>MittiGrid v0.3 &middot; coordinator :${PORT} &middot; refreshes every 3s</div>
+    <div>MittiGrid v0.3.0 &middot; coordinator :${PORT} &middot; refreshes every 3s</div>
     <div>MittiGrid &middot; free &amp; open source &middot; pool every device you own</div>
   </footer>
 </body>
@@ -745,7 +745,9 @@ const server = http.createServer(async (req, res) => {
       const control = desired && !(a.shardAcked && a.shardAcked[0] === desired[0] && a.shardAcked[1] === desired[1])
         ? { type: 'shard', start: desired[0], end: desired[1] }
         : null;
-      const job = jobs.find((j) => j.status === 'queued');
+      // v0.3: a standby device (low battery) keeps its heartbeat but takes
+      // no work — vm jobs heat the phone just like shards do.
+      const job = a.standby ? null : jobs.find((j) => j.status === 'queued');
       if (job) {
         job.status = 'running';
         job.agent = id;
