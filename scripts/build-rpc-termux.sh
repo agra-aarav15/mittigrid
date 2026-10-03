@@ -1,5 +1,5 @@
 #!/bin/sh
-# MittiGrid v0.3 — build llama.cpp with the RPC backend on Termux (Android).
+# MittiGrid v0.4 — build llama.cpp with the RPC backend on Termux (Android).
 # Run inside Termux, from any directory you want llama.cpp/ and build/ to live:
 #   sh build-rpc-termux.sh
 # When it finishes you have ./build/bin/rpc-server — start it and join the grid.

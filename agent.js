@@ -1,4 +1,4 @@
-// MittiGrid v0.3 — agent
+// MittiGrid v0.4 — agent
 // Zero dependencies, node built-ins only. Node >= 20.
 //
 // Joins a MittiGrid coordinator, heartbeats every 3s, polls for jobs,

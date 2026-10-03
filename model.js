@@ -1,4 +1,4 @@
-// MittiGrid v0.2 — toy model, shared by coordinator and agents
+// MittiGrid v0.4 — toy model, shared by coordinator and agents
 // Zero dependencies, node built-ins only. Deterministic: weights come from a
 // fixed-seed PRNG, so every device computes byte-identical weights and a
 // forward pass is reproducible bit-for-bit.

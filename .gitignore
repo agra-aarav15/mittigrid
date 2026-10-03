@@ -1,2 +1,6 @@
 node_modules/
 *.log
+
+# real model weights + llama.cpp binaries — downloaded, never committed
+models/
+tools/

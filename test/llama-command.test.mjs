@@ -1,9 +1,9 @@
-// MittiGrid v0.3 — unit tests for lib/llama-command.js (pure module)
+// MittiGrid v0.4 — unit tests for lib/llama-command.js (pure module)
 // Run: node --test test/
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildLlamaCommand, selectWorkers, sortWorkers, isEligibleWorker } from '../lib/llama-command.js';
+import { buildLlamaCommand, selectWorkers, sortWorkers, isEligibleWorker, tensorSplitShares } from '../lib/llama-command.js';
 
 const worker = (over = {}) => ({
   agent: 'dev',
@@ -89,4 +89,51 @@ test('sortWorkers is stable on ties and does not mutate its input', () => {
 test('fractional ramGB values survive into --tensor-split', () => {
   const cmd = buildLlamaCommand('m.gguf', [worker({ agent: 'x', host: '10.0.0.2', ramGB: 7.8 })]);
   assert.match(cmd, /--tensor-split 7\.8/);
+});
+
+// ---- v0.4: tensorSplitShares (the grid chat's device split) ----------------
+
+test('tensorSplitShares: percentages mirror the command order, one decimal', () => {
+  const shares = tensorSplitShares([
+    worker({ agent: 'phone-8gb', host: '192.168.1.10', ramGB: 8 }),
+    worker({ agent: 'laptop-16gb', host: '192.168.1.20', ramGB: 16 }),
+  ]);
+  assert.deepEqual(shares, [
+    { agent: 'laptop-16gb', ramGB: 16, pct: 66.7 },
+    { agent: 'phone-8gb', ramGB: 8, pct: 33.3 },
+  ]);
+});
+
+test('tensorSplitShares: excludes standby/low-battery workers, same as the command', () => {
+  const shares = tensorSplitShares([
+    worker({ agent: 'sleepy-phone', ramGB: 8, standby: true }),
+    worker({ agent: 'laptop-16gb', ramGB: 16 }),
+  ]);
+  assert.equal(shares.length, 1);
+  assert.equal(shares[0].agent, 'laptop-16gb');
+  assert.equal(shares[0].pct, 100);
+});
+
+test('tensorSplitShares: empty or all-ineligible -> empty array (never fake numbers)', () => {
+  assert.deepEqual(tensorSplitShares([]), []);
+  assert.deepEqual(tensorSplitShares(undefined), []);
+  assert.deepEqual(tensorSplitShares([worker({ host: null })]), []);
+});
+
+test('tensorSplitShares: rounding stays faithful (shares sum to ~100)', () => {
+  const shares = tensorSplitShares([
+    worker({ agent: 'a', ramGB: 7.8 }),
+    worker({ agent: 'b', ramGB: 8 }),
+  ]);
+  const sum = shares.reduce((s, w) => s + w.pct, 0);
+  assert.ok(Math.abs(sum - 100) < 0.2, `expected ~100, got ${sum}`);
+  assert.deepEqual(shares, [
+    { agent: 'b', ramGB: 8, pct: 50.6 },
+    { agent: 'a', ramGB: 7.8, pct: 49.4 },
+  ]);
+});
+
+test('tensorSplitShares: single worker reports 100%', () => {
+  const shares = tensorSplitShares([worker({ agent: 'laptop', ramGB: 16 })]);
+  assert.deepEqual(shares, [{ agent: 'laptop', ramGB: 16, pct: 100 }]);
 });

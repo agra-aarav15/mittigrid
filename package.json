@@ -1,6 +1,6 @@
 {
   "name": "mittigrid",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Every device you own, one brain. Pool idle devices on your LAN or Tailscale into one compute grid.",
   "type": "module",
   "engines": {
@@ -9,7 +9,6 @@
   "scripts": {
     "coord": "node coordinator.js",
     "agent": "node agent.js",
-    "demo": "node demo.js",
     "test": "node --test"
   }
 }

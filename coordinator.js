@@ -1,4 +1,4 @@
-// MittiGrid v0.3.0 — coordinator
+// MittiGrid v0.4.0 — coordinator
 // Zero dependencies, node built-ins only. Node >= 20.
 //
 // v0.1 routes (unchanged):
@@ -25,6 +25,25 @@
 //   GET  /llama/command?model=<file.gguf> -> { ok, model, workers, command }
 //                        (404 {error:'No RPC workers joined yet'} when empty)
 //
+// v0.4 grid chat routes (real model, real numbers — no demo anywhere):
+//   GET  /chat                 -> grid chat page (same monochrome design)
+//   GET  /api/llama/chat-config -> { ok, ready, llamaUrl, model, port,
+//                                   workers, command }. llamaUrl is probed
+//                                   live (/health) and EMPTY when no
+//                                   llama-server is up; model comes from the
+//                                   most recent generated llama command.
+//   POST /api/llama/chat       -> { messages:[{role,content},...] } proxied
+//                                   to llama-server's OpenAI endpoint
+//                                   (/v1/chat/completions, non-streaming).
+//                                   Returns { ok, content, tokens,
+//                                   tokensPerSecond, tokensPerSecondSource,
+//                                   deviceSplit, model, ms }. Tokens/sec comes
+//                                   ONLY from llama-server's own timings
+//                                   field (or a labeled wall-clock fallback) —
+//                                   never invented. deviceSplit mirrors the
+//                                   tensor-split proportions the command
+//                                   generator stored.
+//
 // Battery awareness: /join heartbeats now carry {battery, standby, ramGB, rpc}.
 // A standby (low-battery) agent stays joined but holds no shards and never
 // appears in the llama pool — its layers move to survivors through the
@@ -38,7 +57,8 @@
 import http from 'node:http';
 import { MODEL_LAYERS, DIM, validInput } from './model.js';
 import { batteryLow, normalizeBattery } from './lib/battery.js';
-import { selectWorkers, buildLlamaCommand } from './lib/llama-command.js';
+import { selectWorkers, buildLlamaCommand, tensorSplitShares } from './lib/llama-command.js';
+import { chatConfig, chatResultFromUpstream, validChatMessages, DEFAULT_CHAT_MODEL } from './lib/llama-chat.js';
 
 const PORT = Number(process.env.PORT) || 7400;
 const OFFLINE_MS = 15000; // agent is dimmed/offline when lastSeen is older than this
@@ -271,7 +291,55 @@ function modelStatus() {
 // (low-battery) devices. lib/llama-command.js owns eligibility, ordering
 // (biggest ramGB first) and the generated command, so it stays unit-testable.
 
-const LLAMA_MODEL_PLACEHOLDER = 'model.gguf'; // dashboard's copyable command
+const LLAMA_MODEL_PLACEHOLDER = DEFAULT_CHAT_MODEL; // the model docs/REAL-MODELS.md installs
+
+// ---- v0.4: grid chat state -------------------------------------------------
+// Where the coordinator expects llama-server (the machine the generated
+// command runs on — normally this same laptop). MITTI_LLAMA_HOST /
+// MITTI_LLAMA_PORT override the defaults for split setups.
+const LLAMA_HOST = String(process.env.MITTI_LLAMA_HOST || '127.0.0.1').trim() || '127.0.0.1';
+const LLAMA_PORT_ENV = parseInt(process.env.MITTI_LLAMA_PORT, 10);
+const LLAMA_PROBE_TIMEOUT_MS = 1500;
+const CHAT_TIMEOUT_MS = 300000; // non-streaming generation can be slow on pooled phones
+
+// The most recent llama-server command this coordinator's generator produced
+// ({ model, command, port, workers, at }). /api/llama/chat-config and
+// /api/llama/chat read it so the chat page reports the REAL tensor split and
+// model — never a guess. Only GET /llama/command (an explicit generation)
+// writes it.
+let lastLlamaCommand = null;
+
+function llamaPort() {
+  // An explicit MITTI_LLAMA_PORT wins (that is what "override" means — it is
+  // how you point the chat at a llama-server that runs somewhere else).
+  if (Number.isInteger(LLAMA_PORT_ENV) && LLAMA_PORT_ENV > 0) return LLAMA_PORT_ENV;
+  if (lastLlamaCommand && Number.isInteger(lastLlamaCommand.port) && lastLlamaCommand.port > 0) {
+    return lastLlamaCommand.port;
+  }
+  return 8080; // llama.cpp's default --port, and what the generated command uses
+}
+
+// Live probe: is a llama-server listening? Any HTTP answer (even a 503 while
+// the model loads) means something is there; connection refused/timeout means no.
+async function probeLlama(port) {
+  try {
+    await fetch(`http://${LLAMA_HOST}:${port}/health`, { signal: AbortSignal.timeout(LLAMA_PROBE_TIMEOUT_MS) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function rememberLlamaCommand(model, command, workers) {
+  const m = /--port (\d+)/.exec(command);
+  lastLlamaCommand = {
+    model,
+    command,
+    port: m ? Number(m[1]) : llamaPort(),
+    workers, // the eligible pool as generated — deviceSplit reports THIS
+    at: now(),
+  };
+}
 
 function llamaCandidates() {
   const out = [];
@@ -441,7 +509,7 @@ function dashboardHTML() {
         <td class="${statusCls(j.status)}"${j.error ? ` title="${esc(j.error)}"` : ''}>${esc(j.status)}</td>
         <td>${esc(j.agent || '—')}</td>
         <td class="num">${j.ms != null ? j.ms : '—'}</td>
-      </tr>`).join('\n') || '      <tr><td colspan="6" class="dim">no jobs yet — run: node demo.js</td></tr>';
+      </tr>`).join('\n') || '      <tr><td colspan="6" class="dim">no jobs yet — POST /job {"type":"primes","start":1,"end":1600000,"chunks":8}</td></tr>';
 
   // ---- v0.3: REAL MODEL section (llama.cpp RPC pool) ----
   const batteryChip = (b) => b == null
@@ -461,7 +529,7 @@ function dashboardHTML() {
     : '';
   const cmdBlock = llama.command
     ? `  <pre class="cmd">${esc(llama.command)}</pre>
-  <p class="stats">copy to the laptop that runs llama-server &middot; replace model.gguf with your quantized model &middot; guide: <b>docs/REAL-MODELS.md</b></p>`
+  <p class="stats">copy to the laptop that runs llama-server &middot; when it is up, open <a href="/chat">grid chat</a> &middot; replace the model file name if you use another &middot; guide: <b>docs/REAL-MODELS.md</b></p>`
     : '  <p class="stats dim">waiting for rpc workers — see docs/REAL-MODELS.md</p>';
 
   // ---- v0.3: PULSE MAP state (must survive the meta-refresh cycle) ----
@@ -472,7 +540,7 @@ function dashboardHTML() {
   const pulseJSON = JSON.stringify(pulse).replace(/</g, '\\u003c');
   const pulseNote = model.lastTrace
     ? `last pass <b>${esc(model.lastInferenceMs)}ms</b> &middot; <b>${model.lastTrace.length}</b> hop(s) &middot; the pulse replays on each refresh`
-    : 'no inference yet — run <b>node demo.js --model</b>';
+    : 'no inference yet — POST <b>/model/infer {"input":[8 numbers]}</b>';
 
   return `<!doctype html>
 <html lang="en">
@@ -508,11 +576,12 @@ function dashboardHTML() {
   #pulse { background:#0a0a0a; border:1px solid rgba(255,255,255,0.12); display:block; height:auto; max-width:100%; width:100%; }
   footer { border-top:1px solid rgba(255,255,255,0.12); color:#a3a3a3; font-size:12px; margin-top:32px; padding-top:12px; }
   footer div + div { margin-top:4px; }
+  a { color:#fafafa; }
 </style>
 </head>
 <body>
-  <h1>MittiGrid <span>v0.3 &middot; every device you own, one brain</span></h1>
-  <p class="stats">agents online <b>${st.stats.online}</b> &middot; queued <b>${st.stats.queued}</b> &middot; done <b>${st.stats.done}</b></p>
+  <h1>MittiGrid <span>v0.4 &middot; every device you own, one brain</span></h1>
+  <p class="stats">agents online <b>${st.stats.online}</b> &middot; queued <b>${st.stats.queued}</b> &middot; done <b>${st.stats.done}</b> &middot; <a href="/chat">grid chat</a></p>
   <h2>agents</h2>
   <table>
     <thead><tr><th>name</th><th>platform</th><th class="num">cpus</th><th class="num">ram gb</th><th>busy</th><th class="num">done</th><th class="num">last seen</th></tr></thead>
@@ -528,7 +597,7 @@ ${agentRows}
 ${shardRows}
     </tbody>
   </table>
-  <p class="stats">run inference: <b>node demo.js --model</b> &middot; or POST /model/infer {"input":[8 numbers]}</p>
+  <p class="stats">run inference: POST <b>/model/infer</b> {"input":[8 numbers]}</p>
   <h2>REAL MODEL</h2>
   <p class="stats"><b>${llama.workers.length}</b> rpc worker(s) &middot; ${llama.ready ? 'ready' : 'waiting for rpc agents'}${standbyNote}</p>
   <table>
@@ -648,9 +717,227 @@ ${jobRows}
     </tbody>
   </table>
   <footer>
-    <div>MittiGrid v0.3.0 &middot; coordinator :${PORT} &middot; refreshes every 3s</div>
+    <div>MittiGrid v0.4.0 &middot; coordinator :${PORT} &middot; <a href="/chat">/chat</a> &middot; refreshes every 3s</div>
     <div>MittiGrid &middot; free &amp; open source &middot; pool every device you own</div>
   </footer>
+</body>
+</html>`;
+}
+
+// ---- v0.4: grid chat page --------------------------------------------------
+// Same monochrome design language as the dashboard (same palette, same font
+// stack, same uppercase letterspaced section labels). Interactive — no meta
+// refresh here: the page talks to /api/llama/* with fetch, and the only
+// numbers it ever shows are the ones the backend measured.
+function chatHTML() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MittiGrid — grid chat</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { background:#0a0a0a; color:#fafafa; margin:32px auto; max-width:900px; padding:0 16px;
+         font:14px/1.5 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+  h1 { font-size:22px; font-weight:600; letter-spacing:-0.01em; margin:0; }
+  h1 span { color:#a3a3a3; font-weight:normal; font-size:13px; letter-spacing:0; margin-left:8px; }
+  a { color:#fafafa; }
+  .stats { color:#a3a3a3; margin:6px 0 8px; }
+  .stats b { color:#fafafa; font-weight:600; }
+  h2 { color:#a3a3a3; font-size:11px; font-weight:600; letter-spacing:.08em; margin:26px 0 8px; text-transform:uppercase; }
+  table { border-collapse:collapse; width:100%; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid rgba(255,255,255,0.12); white-space:nowrap; }
+  th { color:#a3a3a3; font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; }
+  td.num, th.num { text-align:right; }
+  .dim { opacity:.4; } .mut { color:#a3a3a3; }
+  .notice { border:1px solid rgba(255,255,255,0.18); margin:10px 0; padding:12px 14px; }
+  .cmd { background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.14); font:12px/1.6 ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+         margin:10px 0 4px; overflow-x:auto; padding:10px 12px; white-space:pre-wrap; word-break:break-all; }
+  .msg { border-left:2px solid rgba(255,255,255,0.22); margin:14px 0; padding:2px 0 2px 14px; }
+  .msg.user { border-left-color:rgba(255,255,255,0.6); }
+  .msg .who { color:#a3a3a3; font-size:11px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; }
+  .msg p { margin:4px 0; white-space:pre-wrap; word-wrap:break-word; }
+  #prompt { background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.14); color:#fafafa; display:block;
+            font-family:inherit; font-size:14px; line-height:1.5; margin:10px 0; min-height:90px; padding:10px 12px; resize:vertical; width:100%; }
+  #prompt:focus { border-color:rgba(255,255,255,0.35); outline:none; }
+  button { background:transparent; border:1px solid rgba(255,255,255,0.3); color:#fafafa; cursor:pointer;
+           font-family:inherit; font-size:11px; font-weight:600; letter-spacing:.08em; padding:8px 18px; text-transform:uppercase; }
+  button:hover { background:rgba(255,255,255,0.08); }
+  button:disabled { cursor:default; opacity:.4; }
+  footer { border-top:1px solid rgba(255,255,255,0.12); color:#a3a3a3; font-size:12px; margin-top:32px; padding-top:12px; }
+</style>
+</head>
+<body>
+  <h1>MittiGrid <span>grid chat &middot; one real model, real numbers</span></h1>
+  <p class="stats"><a href="/">dashboard</a> &middot; every answer reports only <b>measured</b> tokens/sec — read from llama-server's own timings, or a labeled wall-clock fallback. never invented.</p>
+
+  <div id="setup" class="notice dim">checking for llama-server…</div>
+
+  <h2>CHAT</h2>
+  <div id="log"></div>
+  <textarea id="prompt" placeholder="type a prompt for the model, then press Enter"></textarea>
+  <button id="send">SEND</button>
+  <button id="clear">CLEAR</button>
+  <span class="mut" id="hint"></span>
+
+  <h2>LAST ANSWER — REAL NUMBERS</h2>
+  <div id="realstats" class="stats dim">nothing yet — send a prompt.</div>
+  <div id="splitwrap" hidden>
+    <table>
+      <thead><tr><th>DEVICE SPLIT — WHO SERVED IT</th><th class="num">RAM GB</th><th class="num">SHARE OF TENSOR-SPLIT</th></tr></thead>
+      <tbody id="splitbody"></tbody>
+    </table>
+  </div>
+  <p class="stats mut">honest expectation: Gemma 3n E2B on this laptop's CPU answers at roughly <b>5-10 tok/s</b> (measured on the dev laptop; 7.3 tok/s through the RPC grid). Phones joined to the pool add memory capacity — longer context, bigger models — not raw speed.</p>
+
+  <footer>
+    <div>MittiGrid v0.4.0 &middot; grid chat &middot; <a href="/">dashboard</a></div>
+    <div>MittiGrid &middot; free &amp; open source &middot; pool every device you own</div>
+  </footer>
+  <script>
+    (() => {
+      const setup = document.getElementById('setup');
+      const log = document.getElementById('log');
+      const promptEl = document.getElementById('prompt');
+      const sendBtn = document.getElementById('send');
+      const clearBtn = document.getElementById('clear');
+      const hint = document.getElementById('hint');
+      const realstats = document.getElementById('realstats');
+      const splitwrap = document.getElementById('splitwrap');
+      const splitbody = document.getElementById('splitbody');
+      const messages = [];
+      let busy = false;
+
+      const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+      function renderSetup(cfg) {
+        if (!cfg || cfg.ok !== true) {
+          setup.className = 'notice';
+          setup.innerHTML = 'the coordinator did not answer /api/llama/chat-config — is it running?';
+          return;
+        }
+        if (cfg.ready) {
+          setup.className = 'notice';
+          setup.innerHTML = 'llama-server is up: <b>' + esc(cfg.llamaUrl) + '</b>' +
+            ' &middot; model <b>' + esc(cfg.model) + '</b>' +
+            ' &middot; rpc workers in pool: <b>' + cfg.workers + '</b>';
+          return;
+        }
+        setup.className = 'notice';
+        let html = '<b>no llama-server is running right now</b> — the chat cannot answer until it starts.';
+        if (cfg.command) {
+          html += '<p class="stats mut">on the laptop that serves the model, run exactly this' +
+            ' (generated from the ' + cfg.workers + ' rpc worker(s) currently in the pool):</p>' +
+            '<pre class="cmd">' + esc(cfg.command) + '</pre>' +
+            '<p class="stats mut">when it is up, reload this page.</p>';
+        } else {
+          html += '<p class="stats mut">no rpc workers have joined the pool either, so there is no command to copy yet.' +
+            ' on an Android phone (Termux): <b>sh scripts/onboard-phone.sh</b> — it walks you through everything.' +
+            ' on this laptop: <b>node agent.js</b>. full guide: <b>docs/REAL-MODELS.md</b></p>';
+        }
+        setup.innerHTML = html;
+      }
+
+      function addMsg(role, text) {
+        const div = document.createElement('div');
+        div.className = 'msg ' + (role === 'user' ? 'user' : 'model');
+        div.innerHTML = '<div class="who">' + (role === 'user' ? 'you' : 'model') + '</div><p></p>';
+        div.querySelector('p').textContent = text;
+        log.appendChild(div);
+        div.scrollIntoView({ block: 'end' });
+      }
+
+      function renderReal(r) {
+        realstats.className = 'stats';
+        const tps = r.tokensPerSecond != null
+          ? '<b>' + r.tokensPerSecond + '</b> tok/s'
+          : '<b>unavailable</b> tok/s';
+        realstats.innerHTML =
+          'tokens/sec: ' + tps +
+          ' <span class="mut">(source: ' + esc(r.tokensPerSecondSource || 'unknown') + ')</span><br>' +
+          'output tokens: <b>' + (r.tokens != null ? r.tokens : 'unknown') + '</b>' +
+          ' &middot; round trip: <b>' + r.ms + 'ms</b>' +
+          ' &middot; model: <b>' + esc(r.model || '') + '</b>';
+        splitwrap.hidden = false;
+        splitbody.innerHTML = (r.deviceSplit && r.deviceSplit.length)
+          ? r.deviceSplit.map((d) =>
+              '<tr><td>' + esc(d.agent) + '</td><td class="num">' + d.ramGB + '</td><td class="num">' + d.pct + '%</td></tr>').join('')
+          : '<tr><td colspan="3" class="dim">no rpc pool recorded for this answer — llama-server ran it on one machine</td></tr>';
+      }
+
+      function renderFail(data) {
+        realstats.className = 'stats';
+        let html = '<b>failed:</b> ' + esc(data && data.error ? data.error : 'unknown error');
+        if (data && data.command) {
+          html += '<pre class="cmd">' + esc(data.command) + '</pre>' +
+            '<span class="mut">no llama-server answered — start it with the command above, then send again.</span>';
+        }
+        realstats.innerHTML = html;
+        splitwrap.hidden = true;
+      }
+
+      function send() {
+        if (busy) return;
+        const text = promptEl.value.trim();
+        if (!text) return;
+        messages.push({ role: 'user', content: text });
+        addMsg('user', text);
+        promptEl.value = '';
+        busy = true;
+        sendBtn.disabled = true;
+        hint.textContent = 'waiting for the model — the first prompt also loads it into memory, that one is slower';
+        fetch('/api/llama/chat', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ messages }),
+        }).then((r) => r.json()).then((data) => {
+          if (data && data.ok) {
+            messages.push({ role: 'assistant', content: data.content });
+            addMsg('model', data.content);
+            renderReal(data);
+            refreshConfig();
+          } else {
+            messages.pop(); // failed turn: no broken history, give the text back
+            promptEl.value = text;
+            renderFail(data);
+          }
+        }).catch((e) => {
+          messages.pop();
+          promptEl.value = text;
+          renderFail({ error: 'coordinator unreachable: ' + ((e && e.message) || e) });
+        }).then(() => {
+          busy = false;
+          sendBtn.disabled = false;
+          hint.textContent = '';
+        });
+      }
+
+      function refreshConfig() {
+        fetch('/api/llama/chat-config')
+          .then((r) => r.json())
+          .then(renderSetup)
+          .catch(() => renderSetup(null));
+      }
+
+      sendBtn.addEventListener('click', send);
+      clearBtn.addEventListener('click', () => {
+        messages.length = 0;
+        log.innerHTML = '';
+        realstats.className = 'stats dim';
+        realstats.textContent = 'nothing yet — send a prompt.';
+        splitwrap.hidden = true;
+      });
+      promptEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          send();
+        }
+      });
+      refreshConfig();
+    })();
+  </script>
 </body>
 </html>`;
 }
@@ -847,10 +1134,108 @@ const server = http.createServer(async (req, res) => {
       }
       const model = String(url.searchParams.get('model') || '').trim();
       if (!model) {
-        return sendJSON(res, { ok: false, error: 'model query param required, e.g. /llama/command?model=Qwen2.5-7B-Instruct-Q4_K_M.gguf' }, 400);
+        return sendJSON(res, { ok: false, error: 'model query param required, e.g. /llama/command?model=gemma-3n-E2B-it-Q4_K_M.gguf' }, 400);
       }
+      const command = buildLlamaCommand(model, workers);
+      // v0.4: the chat reads this — model + port + the exact pool that was
+      // generated, so deviceSplit reports what the command really encodes.
+      rememberLlamaCommand(model, command, workers);
       console.log(`[llama] command for ${model} across ${workers.length} worker(s)`);
-      return sendJSON(res, { ok: true, model, workers: workers.length, command: buildLlamaCommand(model, workers) });
+      return sendJSON(res, { ok: true, model, workers: workers.length, command });
+    }
+
+    // ---- v0.4 grid chat routes ----
+
+    if (req.method === 'GET' && path === '/chat') {
+      const html = chatHTML();
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-length': Buffer.byteLength(html) });
+      return res.end(html);
+    }
+
+    if (req.method === 'GET' && path === '/api/llama/chat-config') {
+      const port = llamaPort();
+      const llamaUp = await probeLlama(port);
+      const st = llamaStatus(lastLlamaCommand ? lastLlamaCommand.model : LLAMA_MODEL_PLACEHOLDER);
+      return sendJSON(res, chatConfig({
+        lastCommand: lastLlamaCommand,
+        llamaUp,
+        workers: st.workers.length,
+        command: st.command,
+        host: LLAMA_HOST,
+        port,
+      }));
+    }
+
+    if (req.method === 'POST' && path === '/api/llama/chat') {
+      const body = parseJSON(await readBody(req));
+      const messages = validChatMessages(body && body.messages);
+      if (!messages) {
+        return sendJSON(res, {
+          ok: false,
+          error: 'messages must be [{role: "system"|"user"|"assistant", content: "string"}, ...] — at least one, none empty',
+        }, 400);
+      }
+      const port = llamaPort();
+      const base = `http://${LLAMA_HOST}:${port}/v1`;
+      const payload = {
+        model: (lastLlamaCommand && lastLlamaCommand.model) || LLAMA_MODEL_PLACEHOLDER,
+        messages,
+        stream: false,
+      };
+      if (body.temperature != null && Number.isFinite(Number(body.temperature))) {
+        payload.temperature = Number(body.temperature);
+      }
+      if (body.max_tokens != null && Number.isFinite(Number(body.max_tokens)) && Number(body.max_tokens) > 0) {
+        payload.max_tokens = Math.floor(Number(body.max_tokens));
+      }
+      const t0 = Date.now();
+      try {
+        const up = await fetch(base + '/chat/completions', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(CHAT_TIMEOUT_MS),
+        });
+        let data;
+        try {
+          data = await up.json();
+        } catch {
+          return sendJSON(res, { ok: false, error: `llama-server at ${base} returned a non-JSON response (HTTP ${up.status})` }, 502);
+        }
+        const out = chatResultFromUpstream(data, Date.now() - t0);
+        if (!out.ok) {
+          console.log(`[chat] upstream rejected: ${out.error}`);
+          return sendJSON(res, { ok: false, error: out.error }, 502);
+        }
+        // deviceSplit mirrors the tensor-split proportions the command
+        // generator stored (the pool as it was when the running command was
+        // produced); fall back to the current pool when nothing is stored.
+        const pool = (lastLlamaCommand && lastLlamaCommand.workers && lastLlamaCommand.workers.length)
+          ? lastLlamaCommand.workers
+          : selectWorkers(llamaCandidates());
+        const deviceSplit = tensorSplitShares(pool);
+        console.log(`[chat] ok: ${out.tokens ?? '?'} tokens, ${out.tokensPerSecond ?? '?'} tok/s (${out.tokensPerSecondSource})`);
+        return sendJSON(res, {
+          ok: true,
+          content: out.content,
+          tokens: out.tokens,
+          tokensPerSecond: out.tokensPerSecond,
+          tokensPerSecondSource: out.tokensPerSecondSource,
+          deviceSplit,
+          model: payload.model,
+          ms: Date.now() - t0,
+        });
+      } catch (e) {
+        const workers = selectWorkers(llamaCandidates());
+        const model = payload.model;
+        console.log(`[chat] llama-server unreachable at ${base} (${fetchErrText(e)})`);
+        return sendJSON(res, {
+          ok: false,
+          error: `no llama-server answered at ${base} (${fetchErrText(e)}). Start it on this machine with the command below, then send again.`,
+          command: buildLlamaCommand(model, workers),
+          workers: workers.length,
+        }, 503);
+      }
     }
 
     res.writeHead(404, { 'content-type': 'text/plain' });
@@ -862,10 +1247,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[mittigrid] v0.3 coordinator listening on http://localhost:${PORT}`);
-  console.log(`[mittigrid] dashboard: http://localhost:${PORT}/  |  status: http://localhost:${PORT}/status.json`);
+  console.log(`[mittigrid] v0.4.0 coordinator listening on http://localhost:${PORT}`);
+  console.log(`[mittigrid] dashboard: http://localhost:${PORT}/  |  chat: http://localhost:${PORT}/chat  |  status: http://localhost:${PORT}/status.json`);
   console.log(`[mittigrid] model: ${MODEL_LAYERS} layers, sharded across agents — POST /model/infer to run a pass`);
   console.log(`[mittigrid] llama: GET /llama/status | GET /llama/command?model=<file.gguf> (needs rpc-server on a device)`);
+  console.log(`[mittigrid] chat: POST /api/llama/chat proxies to llama-server at ${LLAMA_HOST}:${llamaPort()} (probed live, never faked)`);
 });
 
 // Periodic rebalance: drops shard entries for agents whose heartbeats went

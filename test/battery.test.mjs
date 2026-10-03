@@ -1,4 +1,4 @@
-// MittiGrid v0.3 — unit tests for lib/battery.js (fake-battery variants,
+// MittiGrid v0.4 — unit tests for lib/battery.js (fake-battery variants,
 // normalization, the low-battery rule, env priority)
 // Run: node --test test/
 
