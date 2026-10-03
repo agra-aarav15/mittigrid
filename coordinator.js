@@ -1,26 +1,58 @@
-// MittiGrid v0.1 — coordinator
+// MittiGrid v0.2 — coordinator
 // Zero dependencies, node built-ins only. Node >= 20.
 //
-// Routes:
+// v0.1 routes (unchanged):
 //   GET  /            -> single-file dark dashboard, auto-refresh every 3s
-//   GET  /status.json -> { agents, jobs, stats:{online,queued,done} }
-//   POST /join        -> { id, info }                     register / heartbeat agent
-//   GET  /poll?id=    -> heartbeat + job assignment       { job } | { job: null }
+//   GET  /status.json -> { agents, jobs, stats:{online,queued,done}, model }
+//   POST /join        -> { id, info, shardCapable, shardPort, shard }
+//   GET  /poll?id=    -> { job } | { job: null } (+ control message, see below)
 //   POST /result      -> { id, jobId, ok, result, error, ms }
 //   POST /job         -> { type:'primes', start, end, chunks }
 //                    or { type:'wordcount', text, chunks }
+//
+// v0.2 model routes:
+//   POST /model/infer   { input: number[8] } -> ONE forward pass through the
+//                       sharded pipeline: coordinator calls the FIRST
+//                       shard-holder; agents hop activations to each other
+//                       directly; the last holder returns the final vector.
+//                       Returns { ok, vector, token, ms, attempts, trace }.
+//   GET  /model/status  -> { layers, ready, shards:[{agent, range}], lastTrace }
+//   GET  /model/next?from=N -> which agent holds layer N (agents use this to
+//                       forward activations to the next hop)
+//
+// Shard assignment travels to agents as a control message on /poll:
+// { control: { type:'shard', start, end } }. Agents acknowledge it by sending
+// their current range back on the next /join. (POST /shard/assign was the
+// alternative; the poll channel needed no new endpoint and reuses heartbeats.)
 
 import http from 'node:http';
+import { MODEL_LAYERS, DIM, validInput } from './model.js';
 
 const PORT = Number(process.env.PORT) || 7400;
 const OFFLINE_MS = 15000; // agent is dimmed/offline when lastSeen is older than this
+const HOP_TIMEOUT_MS = 2000; // hard cap on one shard hop (coordinator -> agent)
+const SWEEP_MS = 3000; // periodic rebalance: drops agents that went offline
 
-// id -> { info:{platform,cpus,totalMem}, lastSeen, busy, jobsDone }
+// id -> { info:{platform,cpus,totalMem}, lastSeen, busy, jobsDone,
+//         shardCapable, shardUrl, shardAcked }
 const agents = new Map();
 // { id, batch, type, payload, status:'queued'|'running'|'done', agent, result, error, ms }
 const jobs = [];
 let jobSeq = 0;
 let batchSeq = 0;
+
+// ---- v0.2: model shard registry -----------------------------------------
+// agentId -> [startLayer, endLayer). Contiguous ranges, balanced across
+// shard-capable online agents: 2 agents -> 6+6, 3 -> 4+4+4, ...
+const shards = new Map();
+// agentId -> ts until which it may not hold shards: failover evicts dead
+// holders so the periodic sweep cannot hand layers back to a corpse while its
+// heartbeat still looks fresh. A live /join clears the eviction (revival).
+const evicted = new Map();
+let inferBusy = false; // an inference pass is in flight (route must not move)
+let lastTrace = null; // per-hop trace of the last completed pass
+let lastInferMs = null;
+const lastHopMs = new Map(); // agentId -> ms of its hop in the last pass
 
 const now = () => Date.now();
 const isOnline = (a) => now() - a.lastSeen < OFFLINE_MS;
@@ -52,6 +84,11 @@ function sendJSON(res, obj, code = 200) {
 
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function fetchErrText(e) {
+  const cause = e && e.cause;
+  return (cause && (cause.code || cause.message)) || (e && e.message) || 'unknown';
 }
 
 // Split a submitted job into N deterministic subtasks sharing one batch id.
@@ -103,6 +140,192 @@ function publicJob(j) {
   };
 }
 
+// ---- v0.2: shard map management ------------------------------------------
+
+// The agent's shard server is reached at the IP it connected from (guaranteed
+// routable if it can reach us) plus the port it declared on /join.
+function connHost(req) {
+  let ra = (req.socket && req.socket.remoteAddress) || '127.0.0.1';
+  if (ra.startsWith('::ffff:')) ra = ra.slice(7);
+  if (ra === '::1') ra = '127.0.0.1';
+  return ra;
+}
+
+function shardUrlFor(host, port) {
+  const h = host.includes(':') ? `[${host}]` : host;
+  return `http://${h}:${port}`;
+}
+
+function mapSig(m) {
+  return [...m.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([id, r]) => `${id}:${r[0]}-${r[1]}`)
+    .join(',');
+}
+
+// Recompute balanced contiguous ranges across online shard-capable agents.
+// Called on join and on the periodic sweep (which is how a leave is noticed).
+// Skipped while an inference pass is in flight — never yank the route
+// mid-pipeline; activations are hopping between devices.
+function rebalance(reason) {
+  if (inferBusy) return;
+  for (const [id, until] of evicted) if (until <= now()) evicted.delete(id);
+  const ids = [...agents.entries()]
+    .filter(([id, a]) => isOnline(a) && a.shardCapable && a.shardUrl && !evicted.has(id))
+    .map(([id]) => id)
+    .sort((a, b) => (a < b ? -1 : 1));
+  const next = new Map();
+  if (ids.length) {
+    const per = Math.floor(MODEL_LAYERS / ids.length);
+    let extra = MODEL_LAYERS % ids.length; // first `extra` agents get one more layer
+    let start = 0;
+    for (const id of ids) {
+      const size = per + (extra > 0 ? 1 : 0);
+      if (extra > 0) extra--;
+      next.set(id, [start, start + size]);
+      start += size;
+    }
+  }
+  const cur = mapSig(shards);
+  const sig = mapSig(next);
+  if (cur === sig) return;
+  shards.clear();
+  for (const [id, r] of next) shards.set(id, r);
+  console.log(
+    `[shards] ${reason}: ` +
+      (ids.length
+        ? [...shards.entries()].map(([id, r]) => `${id} ${r[0]}-${r[1]}`).join(', ')
+        : 'no shard-capable agents online — layers unassigned')
+  );
+}
+
+// Fault tolerance: a holder is unreachable, so merge its layers into an
+// adjacent survivor (keeps the map contiguous) and let the caller retry once.
+function failover(fromId) {
+  const range = shards.get(fromId);
+  if (!range) return null;
+  const ordered = [...shards.entries()].sort((a, b) => a[1][0] - b[1][0]);
+  const idx = ordered.findIndex(([id]) => id === fromId);
+  let toId = null;
+  for (const cand of [ordered[idx - 1], ordered[idx + 1]]) {
+    if (cand && cand[0] !== fromId) { toId = cand[0]; break; }
+  }
+  if (!toId) return null;
+  const [s, e] = range;
+  const [ts, te] = shards.get(toId);
+  shards.set(toId, [Math.min(s, ts), Math.max(e, te)]);
+  shards.delete(fromId);
+  evicted.set(fromId, now() + OFFLINE_MS + 1000);
+  console.log(`[shards] shard ${s}-${e} moved ${fromId} -> ${toId} (unreachable)`);
+  return toId;
+}
+
+// Ordered pipeline route from the current shard map. ready = the map covers
+// layers 0..MODEL_LAYERS contiguously.
+function buildRoute() {
+  const route = [...shards.entries()]
+    .map(([agent, [start, end]]) => {
+      const a = agents.get(agent);
+      return a && a.shardUrl ? { agent, url: a.shardUrl, start, end } : null;
+    })
+    .filter(Boolean)
+    .sort((x, y) => x.start - y.start);
+  let ready = route.length > 0 && route[0].start === 0 && route[route.length - 1].end === MODEL_LAYERS;
+  for (let i = 1; i < route.length; i++) if (route[i].start !== route[i - 1].end) ready = false;
+  return { route, ready };
+}
+
+function modelStatus() {
+  const { route, ready } = buildRoute();
+  return {
+    layers: MODEL_LAYERS,
+    ready,
+    shards: route.map((r) => ({
+      agent: r.agent,
+      range: `${r.start}-${r.end}`,
+      lastHopMs: lastHopMs.has(r.agent) ? lastHopMs.get(r.agent) : null,
+    })),
+    lastInferenceMs: lastInferMs,
+    lastTrace,
+  };
+}
+
+// ---- v0.2: pipelined inference -------------------------------------------
+
+// One inference at a time: simple promise lock (a chained queue).
+let inferChain = Promise.resolve();
+function runInference(input) {
+  const pass = inferChain.then(() => doInference(input));
+  inferChain = pass.then(() => undefined, () => undefined);
+  return pass;
+}
+
+async function callShard(entry, input) {
+  try {
+    const res = await fetch(entry.url + '/shard/run', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ input, startLayer: entry.start, endLayer: entry.end }),
+      signal: AbortSignal.timeout(HOP_TIMEOUT_MS),
+    });
+    const data = await res.json();
+    if (!data || data.ok !== true) {
+      const err = new Error((data && data.error) || `shard ${entry.agent} failed`);
+      err.failedAgent = (data && data.failedAgent) || entry.agent;
+      throw err;
+    }
+    return data;
+  } catch (e) {
+    if (e && e.failedAgent != null) throw e; // downstream failure, already attributed
+    const err = new Error(`shard holder ${entry.agent} unreachable (${fetchErrText(e)})`);
+    err.failedAgent = entry.agent;
+    throw err;
+  }
+}
+
+async function doInference(input) {
+  inferBusy = true;
+  const wall0 = Date.now();
+  try {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const { route, ready } = buildRoute();
+      if (!ready) {
+        throw new Error(`model not ready: shard map must cover layers 0-${MODEL_LAYERS} contiguously (have ${route.length} shard(s))`);
+      }
+      try {
+        const out = await callShard(route[0], input);
+        const ms = Date.now() - wall0;
+        lastTrace = out.hops || [];
+        lastInferMs = ms;
+        for (const h of lastTrace) if (h && h.agent) lastHopMs.set(h.agent, h.ms);
+        console.log(
+          `[infer] ok in ${ms}ms (${lastTrace.length} hop(s): ` +
+            lastTrace.map((h) => `${h.agent} ${h.layers} ${h.ms}ms`).join(' -> ') + ')'
+        );
+        return {
+          ok: true,
+          layers: MODEL_LAYERS,
+          vector: out.vector,
+          token: out.token ?? null,
+          ms,
+          attempts: attempt,
+          trace: lastTrace,
+        };
+      } catch (e) {
+        const failed = (e && e.failedAgent) || (route[0] && route[0].agent);
+        if (attempt === 1 && failed && shards.has(failed)) {
+          const to = failover(failed);
+          if (to) continue; // retry the pass once with the repaired map
+        }
+        throw new Error(`inference failed: ${(e && e.message) || e}`);
+      }
+    }
+    throw new Error('inference failed: retries exhausted');
+  } finally {
+    inferBusy = false;
+  }
+}
+
 function statusPayload() {
   const agentList = [...agents.entries()].map(([id, a]) => ({
     id,
@@ -117,11 +340,12 @@ function statusPayload() {
     queued: jobs.filter((j) => j.status === 'queued').length,
     done: jobs.filter((j) => j.status === 'done').length,
   };
-  return { agents: agentList, jobs: jobs.map(publicJob), stats };
+  return { agents: agentList, jobs: jobs.map(publicJob), stats, model: modelStatus() };
 }
 
 function dashboardHTML() {
   const st = statusPayload();
+  const model = st.model;
 
   const agentRows = st.agents.map((a) => {
     const mem = a.info && a.info.totalMem ? (a.info.totalMem / 1073741824).toFixed(1) : '?';
@@ -138,6 +362,12 @@ function dashboardHTML() {
         <td class="num">${seen}</td>
       </tr>`;
   }).join('\n') || '      <tr><td colspan="7" class="dim">no agents yet — run: node agent.js</td></tr>';
+
+  const shardRows = model.shards.map((s) => `      <tr>
+        <td>${esc(s.agent)}</td>
+        <td class="num">${esc(s.range)}</td>
+        <td class="num">${s.lastHopMs != null ? s.lastHopMs : '—'}</td>
+      </tr>`).join('\n') || '      <tr><td colspan="3" class="dim">no shard-capable agents yet — layers unassigned</td></tr>';
 
   const statusCls = (s) => (s === 'done' ? 'ok' : s === 'running' ? 'run' : s === 'queued' ? 'mut' : 'err');
   const jobRows = st.jobs.map((j) => `      <tr>
@@ -190,6 +420,15 @@ function dashboardHTML() {
 ${agentRows}
     </tbody>
   </table>
+  <h2>MODEL SHARDS</h2>
+  <p class="stats"><b>${model.layers}</b> layers &middot; <b>${model.shards.length}</b> shard(s) &middot; ${model.ready ? 'ready' : 'waiting for shard agents'}${model.lastInferenceMs != null ? ` &middot; last pass <b>${model.lastInferenceMs}ms</b>` : ''}</p>
+  <table>
+    <thead><tr><th>agent</th><th class="num">layers</th><th class="num">last hop ms</th></tr></thead>
+    <tbody>
+${shardRows}
+    </tbody>
+  </table>
+  <p class="stats">run inference: <b>node demo.js --model</b> &middot; or POST /model/infer {"input":[8 numbers]}</p>
   <h2>jobs</h2>
   <table>
     <thead><tr><th>id</th><th>batch</th><th>type</th><th>status</th><th>agent</th><th class="num">ms</th></tr></thead>
@@ -198,7 +437,7 @@ ${jobRows}
     </tbody>
   </table>
   <footer>
-    <div>MittiGrid v0.1 &middot; coordinator :${PORT} &middot; refreshes every 3s</div>
+    <div>MittiGrid v0.2 &middot; coordinator :${PORT} &middot; refreshes every 3s</div>
     <div>MittiGrid &middot; free &amp; open source &middot; pool every device you own</div>
   </footer>
 </body>
@@ -228,12 +467,26 @@ const server = http.createServer(async (req, res) => {
       if (!prev) {
         console.log(`[join] ${body.id} (${(body.info && body.info.platform) || '?'}, ${(body.info && body.info.cpus) || '?'} cpus)`);
       }
-      agents.set(body.id, {
+      const shardPort = Math.floor(Number(body.shardPort)) || 0;
+      const capable = body.shardCapable === true && shardPort > 0;
+      evicted.delete(body.id); // a join is proof of life: clear any failover eviction
+      const a = {
         info: body.info || (prev && prev.info) || {},
         lastSeen: now(),
         busy: prev ? prev.busy : false,
         jobsDone: prev ? prev.jobsDone : 0,
-      });
+        // v0.2: this agent hosts model layers in the background
+        shardCapable: capable,
+        shardUrl: capable ? shardUrlFor(connHost(req), shardPort) : null,
+        shardAcked: null,
+      };
+      const desired = shards.get(body.id);
+      if (capable && desired && Array.isArray(body.shard) &&
+          Number(body.shard[0]) === desired[0] && Number(body.shard[1]) === desired[1]) {
+        a.shardAcked = [desired[0], desired[1]];
+      }
+      agents.set(body.id, a);
+      if (capable) rebalance('join');
       return sendJSON(res, { ok: true });
     }
 
@@ -242,18 +495,22 @@ const server = http.createServer(async (req, res) => {
       if (!id) return sendJSON(res, { job: null });
       let a = agents.get(id);
       if (!a) {
-        a = { info: {}, lastSeen: now(), busy: false, jobsDone: 0 };
+        a = { info: {}, lastSeen: now(), busy: false, jobsDone: 0, shardCapable: false, shardUrl: null, shardAcked: null };
         agents.set(id, a);
       }
       a.lastSeen = now();
+      const desired = shards.get(id);
+      const control = desired && !(a.shardAcked && a.shardAcked[0] === desired[0] && a.shardAcked[1] === desired[1])
+        ? { type: 'shard', start: desired[0], end: desired[1] }
+        : null;
       const job = jobs.find((j) => j.status === 'queued');
       if (job) {
         job.status = 'running';
         job.agent = id;
         a.busy = true;
-        return sendJSON(res, { job: { id: job.id, type: job.type, payload: job.payload } });
+        return sendJSON(res, control ? { job: { id: job.id, type: job.type, payload: job.payload }, control } : { job: { id: job.id, type: job.type, payload: job.payload } });
       }
-      return sendJSON(res, { job: null });
+      return sendJSON(res, control ? { job: null, control } : { job: null });
     }
 
     if (req.method === 'POST' && path === '/result') {
@@ -300,6 +557,38 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, { ok: true, batch: split.batch, tasks: split.tasks.length });
     }
 
+    // ---- v0.2 model routes ----
+
+    if (req.method === 'POST' && path === '/model/infer') {
+      const body = parseJSON(await readBody(req));
+      if (!body || !validInput(body.input)) {
+        return sendJSON(res, { ok: false, error: `input must be an array of ${DIM} finite numbers` }, 400);
+      }
+      try {
+        const out = await runInference(body.input.map(Number));
+        return sendJSON(res, out);
+      } catch (e) {
+        return sendJSON(res, { ok: false, error: String((e && e.message) || e) }, 503);
+      }
+    }
+
+    if (req.method === 'GET' && path === '/model/status') {
+      return sendJSON(res, modelStatus());
+    }
+
+    if (req.method === 'GET' && path === '/model/next') {
+      const from = Number(url.searchParams.get('from'));
+      if (!Number.isInteger(from) || from < 0) {
+        return sendJSON(res, { ok: false, error: 'from (layer index) required' }, 400);
+      }
+      if (from >= MODEL_LAYERS) return sendJSON(res, { ok: true, next: null });
+      const { route, ready } = buildRoute();
+      if (!ready) return sendJSON(res, { ok: false, error: 'shards not ready' }, 503);
+      const holder = route.find((r) => from >= r.start && from < r.end);
+      if (!holder) return sendJSON(res, { ok: false, error: `no shard covers layer ${from}` }, 503);
+      return sendJSON(res, { ok: true, next: { agent: holder.agent, url: holder.url, start: holder.start, end: holder.end } });
+    }
+
     res.writeHead(404, { 'content-type': 'text/plain' });
     res.end('not found');
   } catch (e) {
@@ -311,4 +600,10 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`[mittigrid] coordinator listening on http://localhost:${PORT}`);
   console.log(`[mittigrid] dashboard: http://localhost:${PORT}/  |  status: http://localhost:${PORT}/status.json`);
+  console.log(`[mittigrid] model: ${MODEL_LAYERS} layers, sharded across agents — POST /model/infer to run a pass`);
 });
+
+// Periodic rebalance: drops shard entries for agents whose heartbeats went
+// stale (a "leave"), redistributes layers, and picks up any rebalance that
+// was skipped while an inference pass was in flight.
+setInterval(() => rebalance('sweep'), SWEEP_MS);

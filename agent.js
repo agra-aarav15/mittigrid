@@ -1,13 +1,23 @@
-// MittiGrid v0.1 — agent
+// MittiGrid v0.2 — agent
 // Zero dependencies, node built-ins only. Node >= 20.
 //
 // Joins a MittiGrid coordinator, heartbeats every 3s, polls for jobs,
 // executes them inside a node:vm sandbox (10s timeout), posts results back.
 //
-//   node agent.js [--name my-device] [--coord http://<coordinator-ip>:7400]
+// v0.2: the agent also hosts its shard of the toy model in the background.
+// A tiny HTTP server (port 7410+ by default, --port to pin) exposes
+// POST /shard/run {input, startLayer, endLayer}: it computes its layers,
+// then forwards the activations DIRECTLY to the next shard-holder (address
+// learned from the coordinator), until the holder of the last layer applies
+// the head and returns the final vector. Heartbeats and normal jobs never
+// stop while it hosts layers.
+//
+//   node agent.js [--name my-device] [--coord http://<coordinator-ip>:7400] [--port 7410]
 
 import os from 'node:os';
 import vm from 'node:vm';
+import http from 'node:http';
+import { MODEL_LAYERS, DIM, runLayers, head, validInput } from './model.js';
 
 function arg(name, def) {
   const i = process.argv.indexOf('--' + name);
@@ -17,10 +27,24 @@ function arg(name, def) {
   return def;
 }
 
+function strHash(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
 const NAME = arg('name', `${os.hostname()}:${process.pid}`);
 const COORD = String(arg('coord', 'http://localhost:7400')).replace(/\/+$/, '');
+const PORT_ARG = parseInt(arg('port', ''), 10);
+const SHARD_PORT = Number.isFinite(PORT_ARG) && PORT_ARG > 0
+  ? PORT_ARG
+  : 7410 + (strHash(NAME) % 100); // deterministic per-device default
 const HEARTBEAT_MS = 3000; // idle loop cadence: join + poll
 const VM_TIMEOUT_MS = 10000; // hard cap on any single job execution
+const HOP_TIMEOUT_MS = 2000; // hard cap on one shard hop (agent -> agent / coordinator)
+
+let myShard = null; // [start, end) — the layers this device hosts in the background
+let lastServed = null; // last [start, end) actually served via /shard/run
 
 const info = {
   platform: os.platform(),
@@ -28,22 +52,63 @@ const info = {
   totalMem: os.totalmem(),
 };
 
-async function post(path, body) {
+async function post(path, body, timeoutMs = 8000) {
   const res = await fetch(COORD + path, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(8000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   return res.json();
 }
 
-async function get(path) {
-  const res = await fetch(COORD + path, { signal: AbortSignal.timeout(8000) });
+async function get(path, timeoutMs = 8000) {
+  const res = await fetch(COORD + path, { signal: AbortSignal.timeout(timeoutMs) });
+  return res.json();
+}
+
+// raw-URL variant for agent-to-agent activation hops
+async function postJSON(url, body, timeoutMs) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
   return res.json();
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', (c) => {
+      data += c;
+      if (data.length > 10 * 1024 * 1024) {
+        reject(new Error('body too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => resolve(data));
+    req.on('error', reject);
+  });
+}
+
+const parseJSON = (s) => {
+  try { return JSON.parse(s); } catch { return null; }
+};
+
+function sendJSON(res, obj, code = 200) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+  res.end(body);
+}
+
+function fetchErrText(e) {
+  const cause = e && e.cause;
+  return (cause && (cause.code || cause.message)) || (e && e.message) || 'unknown';
+}
 
 // Job execution — inside node:vm so arbitrary payloads stay in a fresh context
 // with a hard timeout. NOTE: node:vm is isolation, not a security boundary.
@@ -94,6 +159,115 @@ function execute(type, payload) {
   }
 }
 
+// ---- v0.2: background shard server ---------------------------------------
+// Serves this device's layers of the toy model. The request carries the exact
+// [startLayer, endLayer) to compute — the coordinator's shard map is the
+// authority — so a merged range can be served immediately after failover,
+// before the new assignment has propagated through the next poll. Weights are
+// local (every device builds the same deterministic toy model), so the device
+// simply computes the range it is asked for and says so when it is wider than
+// the range it last saw.
+const shardServer = http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+  try {
+    if (req.method === 'POST' && url.pathname === '/shard/run') {
+      const body = parseJSON(await readBody(req));
+      if (!body || !validInput(body.input)) {
+        return sendJSON(res, { ok: false, error: `input must be an array of ${DIM} finite numbers` }, 400);
+      }
+      const startLayer = Math.floor(Number(body.startLayer));
+      const endLayer = Math.floor(Number(body.endLayer));
+      if (!Number.isInteger(startLayer) || !Number.isInteger(endLayer) ||
+          startLayer < 0 || endLayer > MODEL_LAYERS || startLayer >= endLayer) {
+        return sendJSON(res, { ok: false, error: `need 0 <= startLayer < endLayer <= ${MODEL_LAYERS}` }, 400);
+      }
+      if (!lastServed || lastServed[0] !== startLayer || lastServed[1] !== endLayer) {
+        lastServed = [startLayer, endLayer];
+        if (myShard && (startLayer < myShard[0] || endLayer > myShard[1])) {
+          console.log(`shard: serving merged range [${startLayer}, ${endLayer}) (assigned [${myShard[0]}, ${myShard[1]})) — failover in progress`);
+        }
+      }
+      const t0 = performance.now();
+      let vec;
+      try {
+        vec = runLayers(body.input, startLayer, endLayer);
+      } catch (e) {
+        return sendJSON(res, { ok: false, error: String((e && e.message) || e) }, 500);
+      }
+      let payload;
+      if (endLayer >= MODEL_LAYERS) {
+        // this device holds the last layer: apply the head, finish the pass
+        const h = head(vec);
+        payload = { ok: true, vector: vec, token: h.token, hops: [] };
+      } else {
+        // learn the next shard-holder from the coordinator, hop activations there
+        let next;
+        try {
+          next = await get(`/model/next?from=${endLayer}`, HOP_TIMEOUT_MS);
+        } catch (e) {
+          return sendJSON(res, { ok: false, error: `coordinator unreachable for next-hop lookup: ${fetchErrText(e)}`, failedAgent: NAME }, 500);
+        }
+        if (!next || !next.ok || !next.next) {
+          return sendJSON(res, { ok: false, error: (next && next.error) || `no shard holder for layer ${endLayer}`, failedAgent: null }, 500);
+        }
+        let downstream;
+        try {
+          downstream = await postJSON(next.next.url + '/shard/run', { input: vec, startLayer: next.next.start, endLayer: next.next.end }, HOP_TIMEOUT_MS);
+        } catch (e) {
+          return sendJSON(res, { ok: false, error: `next shard ${next.next.agent} unreachable (${fetchErrText(e)})`, failedAgent: next.next.agent }, 500);
+        }
+        if (!downstream || downstream.ok !== true) {
+          return sendJSON(res, { ok: false, error: (downstream && downstream.error) || 'downstream shard failed', failedAgent: (downstream && downstream.failedAgent) || next.next.agent }, 500);
+        }
+        payload = downstream; // bubble the final vector back up the chain
+      }
+      // this hop's ms = time spent at this device (compute + downstream wait)
+      const ms = Math.round((performance.now() - t0) * 10) / 10;
+      payload.hops = [{ agent: NAME, layers: `${startLayer}-${endLayer}`, ms }, ...(payload.hops || [])];
+      return sendJSON(res, payload);
+    }
+
+    if (req.method === 'GET' && url.pathname === '/shard/status') {
+      return sendJSON(res, { ok: true, agent: NAME, coord: COORD, port: shardPort, range: myShard, layers: MODEL_LAYERS });
+    }
+
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end('not found');
+  } catch (e) {
+    if (!res.headersSent) sendJSON(res, { ok: false, error: String((e && e.message) || e) }, 500);
+    else res.end();
+  }
+});
+
+function listenOnce(server, port) {
+  return new Promise((resolve, reject) => {
+    const onError = (e) => { cleanup(); reject(e); };
+    const onListening = () => { cleanup(); resolve(); };
+    const cleanup = () => {
+      server.removeListener('error', onError);
+      server.removeListener('listening', onListening);
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(port);
+  });
+}
+
+async function startShardServer() {
+  let port = SHARD_PORT;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    port = SHARD_PORT + attempt;
+    try {
+      await listenOnce(shardServer, port);
+      shardServer.on('error', (e) => console.log(`shard server error: ${(e && e.message) || e}`));
+      return port;
+    } catch {
+      if (attempt < 9) console.log(`[mittigrid] shard port ${port} busy, trying ${port + 1}`);
+    }
+  }
+  throw new Error(`no free port for shard server (tried ${SHARD_PORT}..${SHARD_PORT + 9})`);
+}
+
 console.log(
   `[mittigrid] agent ${NAME} -> ${COORD} ` +
     `(platform=${info.platform} cpus=${info.cpus} mem=${(info.totalMem / 1073741824).toFixed(1)}GB)`
@@ -101,27 +275,48 @@ console.log(
 
 // Main loop: heartbeat every 3s while idle; grab the next job immediately
 // after finishing one so busy agents are never throttled by the cadence.
-for (;;) {
-  try {
-    await post('/join', { id: NAME, info });
-    const r = await get(`/poll?id=${encodeURIComponent(NAME)}`);
-    const job = r && r.job;
-    if (job) {
-      const out = execute(job.type, job.payload);
-      await post('/result', {
-        id: NAME,
-        jobId: job.id,
-        ok: out.ok,
-        result: out.result ?? null,
-        error: out.error ?? null,
-        ms: out.ms,
-      });
-      if (out.ok) console.log(`done ${job.type} ${out.ms}ms`);
-      else console.log(`failed ${job.type} (${out.ms}ms): ${out.error}`);
-      continue;
+async function main() {
+  // v0.2: bring up the shard server before the first join, so the very first
+  // heartbeat can already advertise a live shard port.
+  const shardPort = await startShardServer();
+  console.log(`[mittigrid] shard server on :${shardPort} — hosting toy-model layers in the background`);
+
+  for (;;) {
+    try {
+      await post('/join', { id: NAME, info, shardCapable: true, shardPort, shard: myShard });
+      const r = await get(`/poll?id=${encodeURIComponent(NAME)}`);
+      // v0.2 control channel: the coordinator hands us our layer range here
+      if (r && r.control && r.control.type === 'shard') {
+        const s = Math.floor(Number(r.control.start));
+        const e = Math.floor(Number(r.control.end));
+        if (!myShard || myShard[0] !== s || myShard[1] !== e) {
+          myShard = [s, e];
+          console.log(`shard assigned: layers [${s}, ${e}) of ${MODEL_LAYERS}`);
+        }
+      }
+      const job = r && r.job;
+      if (job) {
+        const out = execute(job.type, job.payload);
+        await post('/result', {
+          id: NAME,
+          jobId: job.id,
+          ok: out.ok,
+          result: out.result ?? null,
+          error: out.error ?? null,
+          ms: out.ms,
+        });
+        if (out.ok) console.log(`done ${job.type} ${out.ms}ms`);
+        else console.log(`failed ${job.type} (${out.ms}ms): ${out.error}`);
+        continue;
+      }
+    } catch (e) {
+      console.log(`coordinator unreachable: ${(e && e.message) || e}`);
     }
-  } catch (e) {
-    console.log(`coordinator unreachable: ${(e && e.message) || e}`);
+    await sleep(HEARTBEAT_MS);
   }
-  await sleep(HEARTBEAT_MS);
 }
+
+main().catch((e) => {
+  console.error(`agent crashed: ${(e && e.message) || e}`);
+  process.exit(1);
+});
